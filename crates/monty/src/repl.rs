@@ -16,6 +16,7 @@ use crate::{
     asyncio::CallId,
     bytecode::{VM, VMSnapshot},
     exception_private::RunError,
+    extensions::ExtensionRegistry,
     heap::{DropWithHeap, Heap, HeapReader},
     intern::{InternerBuilder, Interns},
     io::PrintWriter,
@@ -55,6 +56,12 @@ pub struct MontyRepl<T: ResourceTracker> {
     /// executions these are the only VM values that persist — stack and frames
     /// are transient.
     globals: Vec<Value>,
+    /// Optional extension registry for resolving `import` of extension modules.
+    ///
+    /// Skipped during serialization since extension trait objects are not
+    /// serializable — extensions must be re-registered after deserialization.
+    #[serde(skip)]
+    extension_registry: Option<ExtensionRegistry>,
 }
 
 impl<T: ResourceTracker> MontyRepl<T> {
@@ -73,7 +80,20 @@ impl<T: ResourceTracker> MontyRepl<T> {
             interns: Interns::new(InternerBuilder::default(), Vec::new()),
             heap,
             globals: Vec::new(),
+            extension_registry: None,
         }
+    }
+
+    /// Creates an empty REPL session with an extension registry.
+    ///
+    /// Extensions are resolved during compilation of each snippet — `import ext_name`
+    /// will emit `LoadExtensionModule` when the extension is registered. Host extension
+    /// calls still suspend the VM and are dispatched by the host language binding.
+    #[must_use]
+    pub fn new_with_extensions(script_name: &str, resource_tracker: T, registry: ExtensionRegistry) -> Self {
+        let mut this = Self::new(script_name, resource_tracker);
+        this.extension_registry = Some(registry);
+        this
     }
 
     /// Returns the resource tracker that will be used for the next snippet.
@@ -132,6 +152,7 @@ impl<T: ResourceTracker> MontyRepl<T> {
             this.global_name_map.clone(),
             &this.interns,
             input_names,
+            this.extension_registry.as_mut(),
         ) {
             Ok(exec) => exec,
             Err(error) => return Err(Box::new(ReplStartError { repl: this, error })),
@@ -141,6 +162,9 @@ impl<T: ResourceTracker> MontyRepl<T> {
 
         match HeapReader::with(&mut this.heap, |heap| {
             let mut vm = VM::new(mem::take(&mut this.globals), heap, &executor.interns, print.reborrow());
+            if let Some(ref registry) = this.extension_registry {
+                vm.extension_registry = Some(registry);
+            }
 
             // Inject inputs with VM alive
             if let Err(error) = inject_inputs_into_vm(&executor, input_values, &mut vm) {
@@ -196,12 +220,16 @@ impl<T: ResourceTracker> MontyRepl<T> {
             self.global_name_map.clone(),
             &self.interns,
             input_names,
+            self.extension_registry.as_mut(),
         )?;
 
         self.ensure_globals_size(executor.namespace_size);
 
         let result = HeapReader::with(&mut self.heap, |heap| {
             let mut vm = VM::new(mem::take(&mut self.globals), heap, &executor.interns, print.reborrow());
+            if let Some(ref registry) = self.extension_registry {
+                vm.extension_registry = Some(registry);
+            }
 
             if let Err(e) = inject_inputs_into_vm(&executor, input_values, &mut vm) {
                 self.globals = vm.take_globals();

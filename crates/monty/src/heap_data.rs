@@ -9,6 +9,7 @@ use crate::{
     asyncio::{CallId, Coroutine, GatherFuture, GatherItem},
     bytecode::{CallResult, VM},
     exception_private::{RunError, RunResult, SimpleException},
+    extensions::ExtensionHandleData,
     heap::{DropWithHeap, HeapId, HeapItem, HeapReadOutput},
     intern::FunctionId,
     types::{
@@ -123,6 +124,11 @@ pub(crate) enum HeapData {
     TimeDelta(timedelta::TimeDelta),
     /// A fixed-offset `datetime.timezone` value.
     TimeZone(timezone::TimeZone),
+    /// An opaque handle to an extension-managed object (e.g. a polars DataFrame).
+    ///
+    /// Stored on the heap because handles contain variable-length type names.
+    /// The extension manages the backing storage; Monty only stores the handle metadata.
+    ExtensionHandle(ExtensionHandleData),
 }
 
 impl HeapData {
@@ -240,6 +246,7 @@ impl HeapData {
             Self::DateTime(_) => Type::DateTime,
             Self::TimeDelta(_) => Type::TimeDelta,
             Self::TimeZone(_) => Type::TimeZone,
+            Self::ExtensionHandle(_) => Type::ExtensionHandle,
         }
     }
 
@@ -276,6 +283,7 @@ impl HeapData {
             Self::DateTime(d) => d.py_estimate_size(),
             Self::TimeDelta(d) => d.py_estimate_size(),
             Self::TimeZone(d) => d.py_estimate_size(),
+            Self::ExtensionHandle(h) => h.py_estimate_size(),
         }
     }
 }
@@ -450,6 +458,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
             Self::RePattern(p) => p.py_bool(vm),
             Self::TimeDelta(td) => td.py_bool(vm),
             Self::Date(_) | Self::DateTime(_) | Self::TimeZone(_) => true,
+            Self::ExtensionHandle(_) => true,
         }
     }
 
@@ -479,6 +488,16 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
             HeapReadOutput::TimeDelta(td) => Ok(td.py_call_attr(self_id, vm, attr, args)?),
             HeapReadOutput::Date(d) => Ok(d.py_call_attr(self_id, vm, attr, args)?),
             HeapReadOutput::DateTime(dt) => Ok(dt.py_call_attr(self_id, vm, attr, args)?),
+            HeapReadOutput::ExtensionHandle(h) => {
+                // Extract handle data before calling into the VM (avoids borrow conflicts).
+                let handle_data = ExtensionHandleData {
+                    registry_index: h.get(vm.heap).registry_index,
+                    type_name: h.get(vm.heap).type_name.clone(),
+                    handle_id: h.get(vm.heap).handle_id,
+                };
+                let method_name = attr.as_str(vm.interns).to_string();
+                vm.call_extension_method(&handle_data, self_id, &method_name, args)
+            }
             // Types without methods — return AttributeError
             _ => {
                 args.drop_with_heap(vm);
@@ -518,6 +537,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
             Self::DateTime(d) => d.py_type(vm),
             Self::TimeDelta(d) => d.py_type(vm),
             Self::TimeZone(d) => d.py_type(vm),
+            Self::ExtensionHandle(_) => Type::ExtensionHandle,
         }
     }
 
@@ -715,6 +735,10 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
             Self::DateTime(d) => d.py_repr_fmt(f, vm, heap_ids),
             Self::TimeDelta(d) => d.py_repr_fmt(f, vm, heap_ids),
             Self::TimeZone(d) => d.py_repr_fmt(f, vm, heap_ids),
+            Self::ExtensionHandle(h) => {
+                let data = h.get(vm.heap);
+                Ok(write!(f, "<{} handle={}>", data.type_name, data.handle_id)?)
+            }
         }
     }
 

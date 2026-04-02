@@ -325,6 +325,19 @@ pub enum MontyObject {
         /// Optional docstring for the function.
         docstring: Option<String>,
     },
+    /// An opaque handle to an extension-managed object.
+    ///
+    /// Returned by host extension functions (via `HandleStore.register()`) and
+    /// converted to `HeapData::ExtensionHandle` on the VM heap. Supports method
+    /// syntax (`handle.method()`) when the extension provides method dispatch.
+    ExtensionHandle {
+        /// Index of the owning extension in the registry.
+        registry_index: u16,
+        /// Human-readable type name (e.g. `"ml.Model"`).
+        type_name: String,
+        /// Extension-internal identifier for the object.
+        handle_id: u64,
+    },
     /// Fallback for values that cannot be represented as other variants.
     ///
     /// Contains the `repr()` string of the original value.
@@ -537,6 +550,19 @@ impl MontyObject {
                     Ok(Value::Ref(vm.heap.allocate(HeapData::ExtFunction(name))?))
                 }
             }
+            Self::ExtensionHandle {
+                registry_index,
+                type_name,
+                handle_id,
+            } => {
+                use crate::extensions::ExtensionHandleData;
+                let handle_data = ExtensionHandleData {
+                    registry_index,
+                    type_name,
+                    handle_id,
+                };
+                Ok(Value::Ref(vm.heap.allocate(HeapData::ExtensionHandle(handle_data))?))
+            }
             Self::Repr(_) => Err(InvalidInputError::invalid_type("'Repr' is not a valid input value")),
             Self::Cycle(_, _) => Err(InvalidInputError::invalid_type("'Cycle' is not a valid input value")),
         }
@@ -735,6 +761,11 @@ impl MontyObject {
                     HeapData::ExtFunction(name) => Self::Function {
                         name: name.clone(),
                         docstring: None,
+                    },
+                    HeapData::ExtensionHandle(h) => Self::ExtensionHandle {
+                        registry_index: h.registry_index,
+                        type_name: h.type_name.clone(),
+                        handle_id: h.handle_id,
                     },
                 };
 
@@ -994,6 +1025,11 @@ impl MontyObject {
             Self::Type(t) => write!(f, "<class '{t}'>"),
             Self::BuiltinFunction(func) => write!(f, "<built-in function {func}>"),
             Self::Function { name, .. } => write!(f, "<function '{name}' external>"),
+            Self::ExtensionHandle {
+                type_name, handle_id, ..
+            } => {
+                write!(f, "<{type_name} handle={handle_id}>")
+            }
             Self::Repr(s) => write!(f, "Repr({})", StringRepr(s)),
             Self::Cycle(_, placeholder) => f.write_str(placeholder),
         }
@@ -1030,8 +1066,9 @@ impl MontyObject {
             Self::TimeDelta(delta) => delta.days != 0 || delta.seconds != 0 || delta.microseconds != 0,
             Self::TimeZone(_) => true,
             Self::Exception { .. } => true,
-            Self::Path(_) => true,          // Path instances are always truthy
-            Self::Dataclass { .. } => true, // Dataclass instances are always truthy
+            Self::Path(_) => true,                // Path instances are always truthy
+            Self::Dataclass { .. } => true,       // Dataclass instances are always truthy
+            Self::ExtensionHandle { .. } => true, // Extension handles are always truthy
             Self::Type(_) | Self::BuiltinFunction(_) | Self::Function { .. } | Self::Repr(_) | Self::Cycle(_, _) => {
                 true
             }
@@ -1067,6 +1104,7 @@ impl MontyObject {
             Self::Type(_) => "type",
             Self::BuiltinFunction(_) => "builtin_function_or_method",
             Self::Function { .. } => "function",
+            Self::ExtensionHandle { .. } => "extension_handle",
             Self::Repr(_) => "repr",
             Self::Cycle(_, _) => "cycle",
         }
@@ -1194,6 +1232,18 @@ impl PartialEq for MontyObject {
                     docstring: b_doc,
                 },
             ) => a_name == b_name && a_doc == b_doc,
+            (
+                Self::ExtensionHandle {
+                    registry_index: a_idx,
+                    handle_id: a_id,
+                    ..
+                },
+                Self::ExtensionHandle {
+                    registry_index: b_idx,
+                    handle_id: b_id,
+                    ..
+                },
+            ) => a_idx == b_idx && a_id == b_id,
             (Self::Repr(a), Self::Repr(b)) => a == b,
             (Self::Cycle(a, _), Self::Cycle(b, _)) => a == b,
             (Self::Type(a), Self::Type(b)) => a == b,

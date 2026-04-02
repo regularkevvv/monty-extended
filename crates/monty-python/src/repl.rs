@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ffi::CString,
     sync::{Arc, Mutex, PoisonError, atomic::AtomicBool},
 };
@@ -26,7 +27,7 @@ use crate::{
     exceptions::{MontyError, exc_py_to_monty},
     external::{ExternalFunctionRegistry, dispatch_method_call},
     limits::{CancellationFlag, FutureCancellationGuard, PySignalTracker, extract_limits},
-    monty_cls::{CallbackStringPrint, EitherProgress},
+    monty_cls::{CallbackStringPrint, EitherProgress, build_extension_registry, dispatch_host_extension_call},
 };
 
 /// Runtime REPL session holder for pyclass interoperability.
@@ -62,6 +63,8 @@ impl EitherRepl {
 pub struct PyMontyRepl {
     repl: Mutex<Option<EitherRepl>>,
     dc_registry: DcRegistry,
+    /// Host extension callables, indexed by `"ext:{registry_index}:{function_name}"`.
+    host_extension_callables: Option<Arc<HashMap<String, Py<PyAny>>>>,
 
     /// Name of the script being executed.
     #[pyo3(get)]
@@ -75,27 +78,52 @@ impl PyMontyRepl {
     /// No code is parsed or executed at construction time — all execution
     /// is driven through `feed_run()`.
     #[new]
-    #[pyo3(signature = (*, script_name="main.py", limits=None, dataclass_registry=None))]
+    #[pyo3(signature = (*, script_name="main.py", limits=None, dataclass_registry=None, extensions=None))]
     fn new(
         py: Python<'_>,
         script_name: &str,
         limits: Option<&Bound<'_, PyDict>>,
         dataclass_registry: Option<&Bound<'_, PyList>>,
+        extensions: Option<&Bound<'_, PyList>>,
     ) -> PyResult<Self> {
         let dc_registry = DcRegistry::from_list(py, dataclass_registry)?;
         let script_name = script_name.to_string();
 
+        // Build extension registry and host callables if extensions are provided
+        let (registry, host_callables) = if let Some(ext_list) = extensions
+            && !ext_list.is_empty()
+        {
+            let (reg, callables) = build_extension_registry(py, ext_list)?;
+            let host: Option<Arc<HashMap<String, Py<PyAny>>>> = if callables.is_empty() {
+                None
+            } else {
+                Some(Arc::new(callables))
+            };
+            (Some(reg), host)
+        } else {
+            (None, None)
+        };
+
         let repl = if let Some(limits) = limits {
             let tracker = PySignalTracker::new(LimitedTracker::new(extract_limits(limits)?));
-            EitherRepl::Limited(CoreMontyRepl::new(&script_name, tracker))
+            if let Some(reg) = registry {
+                EitherRepl::Limited(CoreMontyRepl::new_with_extensions(&script_name, tracker, reg))
+            } else {
+                EitherRepl::Limited(CoreMontyRepl::new(&script_name, tracker))
+            }
         } else {
             let tracker = PySignalTracker::new(NoLimitTracker);
-            EitherRepl::NoLimit(CoreMontyRepl::new(&script_name, tracker))
+            if let Some(reg) = registry {
+                EitherRepl::NoLimit(CoreMontyRepl::new_with_extensions(&script_name, tracker, reg))
+            } else {
+                EitherRepl::NoLimit(CoreMontyRepl::new(&script_name, tracker))
+            }
         };
 
         Ok(Self {
             repl: Mutex::new(Some(repl)),
             dc_registry,
+            host_extension_callables: host_callables,
             script_name,
         })
     }
@@ -134,7 +162,7 @@ impl PyMontyRepl {
             None => PrintWriter::Stdout,
         };
 
-        if external_functions.is_some() || os.is_some() {
+        if external_functions.is_some() || os.is_some() || self.host_extension_callables.is_some() {
             return self.feed_run_with_externals(py, code, input_values, external_functions, os, print_writer);
         }
 
@@ -307,6 +335,7 @@ impl PyMontyRepl {
         Ok(Self {
             repl: Mutex::new(Some(serialized.repl)),
             dc_registry: DcRegistry::from_list(py, dataclass_registry)?,
+            host_extension_callables: None,
             script_name: serialized.script_name,
         })
     }
@@ -642,6 +671,15 @@ impl PyMontyRepl {
                 ReplProgress::FunctionCall(call) => {
                     let return_value = if call.method_call {
                         dispatch_method_call(py, &call.function_name, &call.args, &call.kwargs, &self.dc_registry)
+                    } else if call.function_name.starts_with("ext:") {
+                        dispatch_host_extension_call(
+                            py,
+                            &call.function_name,
+                            &call.args,
+                            &call.kwargs,
+                            self.host_extension_callables.as_ref(),
+                            &self.dc_registry,
+                        )
                     } else if let Some(ext_fns) = external_functions {
                         let registry = ExternalFunctionRegistry::new(py, ext_fns, &self.dc_registry);
                         registry.call(&call.function_name, &call.args, &call.kwargs)
@@ -738,6 +776,7 @@ impl PyMontyRepl {
         Self {
             repl: Mutex::new(None),
             dc_registry,
+            host_extension_callables: None,
             script_name,
         }
     }

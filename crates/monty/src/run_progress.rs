@@ -6,7 +6,7 @@
 //! The internal [`Snapshot`] type is `pub(crate)` — callers interact exclusively with
 //! the per-variant structs.
 
-use std::mem;
+use std::{mem, sync::Arc};
 
 use serde::de::DeserializeOwned;
 
@@ -15,6 +15,7 @@ use crate::{
     asyncio::CallId,
     bytecode::{FrameExit, VM, VMSnapshot},
     exception_private::{RunError, RunResult},
+    extensions::ExtensionRegistry,
     heap::{Heap, HeapReader},
     io::PrintWriter,
     object::MontyObject,
@@ -329,6 +330,11 @@ impl<T: ResourceTracker> NameLookup<T> {
                 print.reborrow(),
             );
 
+            // Restore extension registry on the VM
+            if let Some(ref registry) = self.snapshot.extension_registry {
+                vm.extension_registry = Some(registry);
+            }
+
             // Resolve the name lookup result with the VM alive
             let vm_result = match result {
                 NameLookupResult::Value(obj) => {
@@ -364,7 +370,13 @@ impl<T: ResourceTracker> NameLookup<T> {
             let vm_state = check_snapshot_from_converted(&converted, vm);
             Ok((converted, vm_state))
         })?;
-        build_run_progress(converted, vm_state, self.snapshot.executor, self.snapshot.heap)
+        build_run_progress(
+            converted,
+            vm_state,
+            self.snapshot.executor,
+            self.snapshot.heap,
+            self.snapshot.extension_registry,
+        )
     }
 }
 
@@ -390,16 +402,26 @@ pub struct ResolveFutures<T: ResourceTracker> {
     heap: Heap<T>,
     /// The pending call_ids that this snapshot is waiting on.
     pending_call_ids: Vec<u32>,
+    /// Optional extension registry, not serialized.
+    #[serde(skip)]
+    extension_registry: Option<Arc<ExtensionRegistry>>,
 }
 
 impl<T: ResourceTracker> ResolveFutures<T> {
     /// Creates a new `ResolveFutures` from its parts.
-    fn new(executor: Executor, vm_state: VMSnapshot, heap: Heap<T>, pending_call_ids: Vec<u32>) -> Self {
+    fn new(
+        executor: Executor,
+        vm_state: VMSnapshot,
+        heap: Heap<T>,
+        pending_call_ids: Vec<u32>,
+        extension_registry: Option<Arc<ExtensionRegistry>>,
+    ) -> Self {
         Self {
             executor,
             vm_state,
             heap,
             pending_call_ids,
+            extension_registry,
         }
     }
 
@@ -434,6 +456,7 @@ impl<T: ResourceTracker> ResolveFutures<T> {
             vm_state,
             mut heap,
             pending_call_ids,
+            extension_registry,
         } = self;
 
         // Validate that all provided call_ids are in the pending set before restoring VM.
@@ -451,6 +474,11 @@ impl<T: ResourceTracker> ResolveFutures<T> {
                 &executor.interns,
                 print.reborrow(),
             );
+
+            // Restore extension registry on the VM
+            if let Some(ref registry) = extension_registry {
+                vm.extension_registry = Some(registry);
+            }
 
             // Now check for invalid call_ids after VM is restored.
             if let Some(call_id) = invalid_call_id {
@@ -507,7 +535,7 @@ impl<T: ResourceTracker> ResolveFutures<T> {
             let vm_state = check_snapshot_from_converted(&converted, vm);
             Ok((converted, vm_state))
         })?;
-        build_run_progress(converted, vm_state, executor, heap)
+        build_run_progress(converted, vm_state, executor, heap, extension_registry)
     }
 }
 
@@ -529,6 +557,12 @@ pub(crate) struct Snapshot<T: ResourceTracker> {
     pub(crate) vm_state: VMSnapshot,
     /// The heap containing all allocated objects.
     pub(crate) heap: Heap<T>,
+    /// Optional extension registry for native/host extension support.
+    ///
+    /// Not serialized because it contains trait objects and library handles.
+    /// Threaded through snapshot/resume cycles via `Arc` for shared ownership.
+    #[serde(skip)]
+    pub(crate) extension_registry: Option<Arc<ExtensionRegistry>>,
 }
 
 impl<T: ResourceTracker> Snapshot<T> {
@@ -549,6 +583,11 @@ impl<T: ResourceTracker> Snapshot<T> {
                 print.reborrow(),
             );
 
+            // Restore extension registry on the VM for continued execution
+            if let Some(ref registry) = self.extension_registry {
+                vm.extension_registry = Some(registry);
+            }
+
             let vm_result = match ext_result {
                 ExtFunctionResult::Return(obj) => vm.resume(obj),
                 ExtFunctionResult::Error(exc) => vm.resume_with_exception(exc.into()),
@@ -568,7 +607,7 @@ impl<T: ResourceTracker> Snapshot<T> {
             let vm_state = check_snapshot_from_converted(&converted, vm);
             (converted, vm_state)
         });
-        build_run_progress(converted, vm_state, self.executor, self.heap)
+        build_run_progress(converted, vm_state, self.executor, self.heap, self.extension_registry)
     }
 }
 
@@ -771,6 +810,7 @@ pub(crate) fn build_run_progress<T: ResourceTracker>(
     vm_state: Option<VMSnapshot>,
     executor: Executor,
     heap: Heap<T>,
+    extension_registry: Option<Arc<ExtensionRegistry>>,
 ) -> Result<RunProgress<T>, MontyException> {
     macro_rules! new_snapshot {
         () => {
@@ -778,6 +818,7 @@ pub(crate) fn build_run_progress<T: ResourceTracker>(
                 executor,
                 vm_state: vm_state.expect("snapshot should exist"),
                 heap,
+                extension_registry,
             }
         };
     }
@@ -815,6 +856,7 @@ pub(crate) fn build_run_progress<T: ResourceTracker>(
             vm_state.expect("snapshot should exist for ResolveFutures"),
             heap,
             pending_call_ids,
+            extension_registry,
         ))),
         ConvertedExit::NameLookup {
             name,

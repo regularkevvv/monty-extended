@@ -5,6 +5,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use abi_stable::std_types::ROption;
+use monty_extension_api::ResourceBudget;
+
 use crate::{
     ExcType, MontyException,
     exception_private::{ExceptionRaise, RawStackFrame, RunError, SimpleException},
@@ -294,6 +297,18 @@ pub trait ResourceTracker: fmt::Debug {
     /// # Arguments
     /// * `additional_bytes` - Approximate additional memory consumed by the growth
     fn on_grow(&self, additional_bytes: usize) -> Result<(), ResourceError>;
+
+    /// Returns the current resource budget for passing to native extension calls.
+    ///
+    /// Extensions receive this budget via `ExtContext` so they can cooperatively
+    /// check limits during long-running operations. The default implementation
+    /// returns unlimited budgets (`RNone` for all fields).
+    fn resource_budget(&self) -> ResourceBudget {
+        ResourceBudget {
+            remaining_time_ms: ROption::RNone,
+            remaining_allocations: ROption::RNone,
+        }
+    }
 }
 
 /// A resource tracker that imposes no limits except default recursion limit.
@@ -599,5 +614,22 @@ impl ResourceTracker for LimitedTracker {
             }
         }
         Ok(())
+    }
+
+    fn resource_budget(&self) -> ResourceBudget {
+        let remaining_time_ms = self.limits.max_duration.map_or(ROption::RNone, |max| {
+            let elapsed = self.start_time.elapsed();
+            // Saturate to u64::MAX for durations exceeding ~584 million years
+            let millis = u64::try_from(max.saturating_sub(elapsed).as_millis()).unwrap_or(u64::MAX);
+            ROption::RSome(millis)
+        });
+        let remaining_allocations = self.limits.max_allocations.map_or(ROption::RNone, |max| {
+            let remaining = u64::try_from(max.saturating_sub(self.allocation_count.get())).unwrap_or(u64::MAX);
+            ROption::RSome(remaining)
+        });
+        ResourceBudget {
+            remaining_time_ms,
+            remaining_allocations,
+        }
     }
 }

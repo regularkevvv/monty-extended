@@ -44,6 +44,7 @@ class Monty:
         type_check: bool = False,
         type_check_stubs: str | None = None,
         dataclass_registry: list[type] | None = None,
+        extensions: list[dict[str, Any]] | None = None,
     ) -> Self:
         """
         Create a new Monty interpreter by parsing the given code.
@@ -57,10 +58,24 @@ class Monty:
                 e.g. with input variable declarations or external function signatures
             dataclass_registry: Optional list of dataclass types to register for proper
                 isinstance() support on output, see `register_dataclass()` above.
+            extensions: Optional list of extension dicts. Each dict must have
+                ``module_name`` (str), ``functions`` (list of ``{name, is_native}`` dicts),
+                ``skill`` (str), ``version`` (str), and optionally ``callables``
+                (dict mapping function name to Python callable for host extensions).
+                Use ``MontyModule.to_extension_dict()`` to create these dicts.
 
         Raises:
             MontySyntaxError: If the code cannot be parsed
             MontyTypingError: If type_check is True and type errors are found
+        """
+
+    def extension_skills(self) -> str:
+        """
+        Returns concatenated skill text from all registered extensions.
+
+        Skills are markdown strings describing extension capabilities, designed
+        for injection into AI agent system prompts. Returns an empty string if
+        no extensions are registered or none have skills.
         """
 
     def type_check(self, prefix_code: str | None = None) -> None:

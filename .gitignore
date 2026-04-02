@@ -1,7 +1,8 @@
 *.py[cod]
 *.so
+.DS_Store
 /.idea/
-/target/
+**/target/
 /env*/
 /*.py
 /TODO.md
@@ -19,3 +20,4 @@
 /crates/fuzz/corpus/
 /.worktrees/
 /.zed/
+__pycache__/

@@ -10,6 +10,7 @@ mod bytecode;
 mod exception_private;
 mod exception_public;
 mod expressions;
+pub mod extensions;
 mod fstring;
 mod function;
 mod heap_data;
@@ -35,6 +36,7 @@ pub use crate::run::RefCountOutput;
 pub use crate::{
     exception_private::ExcType,
     exception_public::{CodeLoc, MontyException, StackFrame},
+    extensions::ExtensionRegistry,
     io::{PrintWriter, PrintWriterCallback},
     object::{DictPairs, InvalidInputError, MontyDate, MontyDateTime, MontyObject, MontyTimeDelta, MontyTimeZone},
     os::{OsFunction, dir_stat, file_stat, stat_result, symlink_stat},

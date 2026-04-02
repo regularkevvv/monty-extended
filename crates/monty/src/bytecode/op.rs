@@ -440,6 +440,13 @@ pub enum Opcode {
     /// Pops iterable (TOS), adds each item to set at stack position `len - 2 - depth`.
     /// Raises `TypeError` if iterable is not iterable.
     SetExtend,
+
+    /// Load an extension module onto the stack. Operand: u16 registry_index.
+    ///
+    /// The registry_index identifies the extension in the `ExtensionRegistry`.
+    /// Creates the module on the heap (populating it with `ExtensionFunction` values)
+    /// and pushes a `Value::Ref` to it.
+    LoadExtensionModule,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -558,8 +565,9 @@ impl Opcode {
             Nop => 0,
 
             // Module
-            LoadModule => 1,       // push module
-            RaiseImportError => 0, // raises exception, no stack change before that
+            LoadModule => 1,          // push module
+            RaiseImportError => 0,    // raises exception, no stack change before that
+            LoadExtensionModule => 1, // push module
         })
     }
 }
@@ -584,8 +592,8 @@ mod tests {
 
     #[test]
     fn test_opcode_roundtrip() {
-        // Verify that all opcodes from 0 to DeleteGlobal (last opcode) can be converted to u8 and back.
-        for byte in 0..=Opcode::DeleteGlobal as u8 {
+        // Verify that all opcodes from 0 to LoadExtensionModule (last opcode) can be converted to u8 and back.
+        for byte in 0..=Opcode::LoadExtensionModule as u8 {
             let opcode = Opcode::try_from(byte).unwrap();
             assert_eq!(opcode as u8, byte, "opcode {opcode:?} has wrong discriminant");
         }
@@ -601,12 +609,13 @@ mod tests {
         assert_eq!(Opcode::DeleteGlobal as u8, 112);
         assert_eq!(Opcode::DictUpdate as u8, 113);
         assert_eq!(Opcode::SetExtend as u8, 114);
+        assert_eq!(Opcode::LoadExtensionModule as u8, 115);
     }
 
     #[test]
     fn test_invalid_opcode() {
         // Byte just after the last valid opcode should fail
-        let result = Opcode::try_from(Opcode::SetExtend as u8 + 1);
+        let result = Opcode::try_from(Opcode::LoadExtensionModule as u8 + 1);
         assert!(result.is_err());
         // 255 should also fail
         let result = Opcode::try_from(255u8);

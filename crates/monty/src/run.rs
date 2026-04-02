@@ -1,5 +1,8 @@
 //! Public interface for running Monty code.
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use ahash::AHashMap;
 
@@ -7,6 +10,7 @@ use crate::{
     ExcType, MontyException,
     bytecode::{Code, Compiler, FrameExit, VM},
     exception_private::RunResult,
+    extensions::ExtensionRegistry,
     heap::{DropWithHeap, Heap, HeapReader},
     intern::{InternerBuilder, Interns},
     io::PrintWriter,
@@ -38,6 +42,13 @@ use crate::{
 pub struct MontyRun {
     /// The underlying executor containing parsed AST and interns.
     executor: Executor,
+    /// Optional extension registry for native/host extension support.
+    ///
+    /// Not serialized because it contains trait objects and library handles
+    /// that can't cross process boundaries. When deserializing, extensions
+    /// must be re-registered.
+    #[serde(skip)]
+    extension_registry: Option<Arc<ExtensionRegistry>>,
 }
 
 impl MontyRun {
@@ -54,7 +65,45 @@ impl MontyRun {
     /// # Errors
     /// Returns `MontyException` if the code cannot be parsed.
     pub fn new(code: String, script_name: &str, input_names: Vec<String>) -> Result<Self, MontyException> {
-        Executor::new(code, script_name, input_names).map(|executor| Self { executor })
+        Executor::new(code, script_name, input_names, None).map(|executor| Self {
+            executor,
+            extension_registry: None,
+        })
+    }
+
+    /// Creates a new run snapshot with an extension registry.
+    ///
+    /// The registry is consulted during compilation: imports of registered extension
+    /// modules emit `LoadExtensionModule` instead of `RaiseImportError`. At runtime,
+    /// the registry is passed to the VM for module creation and native function dispatch.
+    ///
+    /// The registry is consumed and wrapped in an `Arc` for shared ownership across
+    /// snapshot/resume cycles. Extension names are interned during compilation.
+    ///
+    /// # Arguments
+    /// * `code` - The Python code to execute
+    /// * `script_name` - The script name for error messages
+    /// * `input_names` - Names of input variables
+    /// * `registry` - Extension registry with native and/or host extensions
+    ///
+    /// # Errors
+    /// Returns `MontyException` if the code cannot be parsed.
+    pub fn new_with_extensions(
+        code: String,
+        script_name: &str,
+        input_names: Vec<String>,
+        mut registry: ExtensionRegistry,
+    ) -> Result<Self, MontyException> {
+        Executor::new(code, script_name, input_names, Some(&mut registry)).map(|executor| Self {
+            executor,
+            extension_registry: Some(Arc::new(registry)),
+        })
+    }
+
+    /// Returns the extension registry, if one was registered.
+    #[must_use]
+    pub fn extension_registry(&self) -> Option<&Arc<ExtensionRegistry>> {
+        self.extension_registry.as_ref()
     }
 
     /// Returns the code that was parsed to create this snapshot.
@@ -84,7 +133,8 @@ impl MontyRun {
         resource_tracker: impl ResourceTracker,
         print: PrintWriter<'_>,
     ) -> Result<MontyObject, MontyException> {
-        self.executor.run(inputs, resource_tracker, print)
+        self.executor
+            .run(inputs, resource_tracker, print, self.extension_registry.as_deref())
     }
 
     /// Executes the code to completion with no resource limits, printing to stdout/stderr.
@@ -146,12 +196,19 @@ impl MontyRun {
         mut print: PrintWriter<'_>,
     ) -> Result<RunProgress<T>, MontyException> {
         let executor = self.executor;
+        let extension_registry = self.extension_registry;
 
         // Create heap and VM with empty globals, then populate inputs with VM alive
         let mut heap = Heap::new(executor.namespace_size, resource_tracker);
         let globals = executor.empty_globals();
         let (converted, vm_state) = HeapReader::with(&mut heap, |heap| {
             let mut vm = VM::new(globals, heap, &executor.interns, print.reborrow());
+
+            // Set extension registry on the VM if one was registered
+            if let Some(ref registry) = extension_registry {
+                vm.extension_registry = Some(registry);
+            }
+
             executor.populate_inputs(inputs, &mut vm)?;
 
             // Start execution
@@ -162,7 +219,7 @@ impl MontyRun {
             let vm_state = check_snapshot_from_converted(&converted, vm);
             Ok((converted, vm_state))
         })?;
-        build_run_progress(converted, vm_state, executor, heap)
+        build_run_progress(converted, vm_state, executor, heap, extension_registry)
     }
 }
 
@@ -212,17 +269,35 @@ impl Clone for Executor {
 
 impl Executor {
     /// Creates a new executor with the given code, filename, and input names.
-    pub(crate) fn new(code: String, script_name: &str, input_names: Vec<String>) -> Result<Self, MontyException> {
+    ///
+    /// If `extension_registry` is provided, extension names are interned into the
+    /// intern table and the compiler emits `LoadExtensionModule` for known extension imports.
+    pub(crate) fn new(
+        code: String,
+        script_name: &str,
+        input_names: Vec<String>,
+        mut extension_registry: Option<&mut ExtensionRegistry>,
+    ) -> Result<Self, MontyException> {
         let parse_result = parse(&code, script_name).map_err(|e| e.into_python_exc(script_name, &code))?;
-        let prepared = prepare(parse_result, input_names).map_err(|e| e.into_python_exc(script_name, &code))?;
+        let mut prepared = prepare(parse_result, input_names).map_err(|e| e.into_python_exc(script_name, &code))?;
+
+        // Intern extension names before creating Interns, so StringIds are valid
+        if let Some(ref mut registry) = extension_registry {
+            registry.intern_names(&mut prepared.interner);
+        }
 
         // Create interns with empty functions (functions will be set after compilation)
         let mut interns = Interns::new(prepared.interner, Vec::new());
 
         // Compile the module to bytecode, which also compiles all nested functions
         let namespace_size_u16 = u16::try_from(prepared.namespace_size).expect("module namespace size exceeds u16");
-        let compile_result = Compiler::compile_module(&prepared.nodes, &interns, namespace_size_u16)
-            .map_err(|e| e.into_python_exc(script_name, &code))?;
+        let compile_result = Compiler::compile_module(
+            &prepared.nodes,
+            &interns,
+            namespace_size_u16,
+            extension_registry.map(|r| &*r),
+        )
+        .map_err(|e| e.into_python_exc(script_name, &code))?;
 
         // Set the compiled functions in the interns
         interns.set_functions(compile_result.functions);
@@ -254,6 +329,7 @@ impl Executor {
         mut existing_name_map: AHashMap<String, NamespaceId>,
         existing_interns: &Interns,
         input_names: Vec<String>,
+        mut extension_registry: Option<&mut ExtensionRegistry>,
     ) -> Result<Self, MontyException> {
         // Pre-register input names so they get stable slots before preparation.
         for name in &input_names {
@@ -263,7 +339,13 @@ impl Executor {
                 .or_insert_with(|| NamespaceId::new(next_slot));
         }
 
-        let seeded_interner = InternerBuilder::from_interns(existing_interns, &code);
+        let mut seeded_interner = InternerBuilder::from_interns(existing_interns, &code);
+
+        // Intern extension names so they are available during compilation
+        if let Some(ref mut registry) = extension_registry {
+            registry.intern_names(&mut seeded_interner);
+        }
+
         let parse_result = parse_with_interner(&code, script_name, seeded_interner)
             .map_err(|e| e.into_python_exc(script_name, &code))?;
         let prepared = prepare_with_existing_names(parse_result, existing_name_map)
@@ -272,9 +354,14 @@ impl Executor {
         let existing_functions = existing_interns.functions_clone();
         let mut interns = Interns::new(prepared.interner, Vec::new());
         let namespace_size_u16 = u16::try_from(prepared.namespace_size).expect("module namespace size exceeds u16");
-        let compile_result =
-            Compiler::compile_module_with_functions(&prepared.nodes, &interns, namespace_size_u16, existing_functions)
-                .map_err(|e| e.into_python_exc(script_name, &code))?;
+        let compile_result = Compiler::compile_module_with_functions(
+            &prepared.nodes,
+            &interns,
+            namespace_size_u16,
+            existing_functions,
+            extension_registry.map(|r| &*r),
+        )
+        .map_err(|e| e.into_python_exc(script_name, &code))?;
         interns.set_functions(compile_result.functions);
 
         Ok(Self {
@@ -303,6 +390,7 @@ impl Executor {
         inputs: Vec<MontyObject>,
         resource_tracker: impl ResourceTracker,
         mut print: PrintWriter<'_>,
+        extension_registry: Option<&ExtensionRegistry>,
     ) -> Result<MontyObject, MontyException> {
         let heap_capacity = self.heap_capacity.load(Ordering::Relaxed);
         let mut heap = Heap::new(heap_capacity, resource_tracker);
@@ -311,6 +399,9 @@ impl Executor {
         // Create VM first, then populate inputs with VM alive
         let result = HeapReader::with(&mut heap, |heap| {
             let mut vm = VM::new(globals, heap, &self.interns, print.reborrow());
+            if let Some(registry) = extension_registry {
+                vm.extension_registry = Some(registry);
+            }
             self.populate_inputs(inputs, &mut vm)?;
             let result = self.run_to_completion(&mut vm);
             vm.cleanup();

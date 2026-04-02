@@ -23,6 +23,9 @@ from ._monty import (
     load_repl_snapshot,
     load_snapshot,
 )
+from .decorators import MontyModule
+from .enforcement import enforce_call_count, enforce_size, enforce_timeout
+from .handles import HandleStore
 from .os_access import AbstractFile, AbstractOS, CallbackFile, MemoryFile, OSAccess, OsFunction, StatResult
 
 __all__ = (
@@ -54,6 +57,12 @@ __all__ = (
     'MemoryFile',
     'CallbackFile',
     'OSAccess',
+    # extensions
+    'MontyModule',
+    'HandleStore',
+    'enforce_timeout',
+    'enforce_size',
+    'enforce_call_count',
 )
 
 

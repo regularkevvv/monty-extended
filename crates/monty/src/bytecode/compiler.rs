@@ -24,6 +24,7 @@ use crate::{
         Callable, CmpOperator, Comprehension, DictItem, Expr, ExprLoc, Identifier, Literal, NameScope, Node, Operator,
         PreparedFunctionDef, PreparedNode, SequenceItem, UnpackTarget,
     },
+    extensions::ExtensionRegistry,
     fstring::{ConversionFlag, FStringPart, FormatSpec, ParsedFormatSpec, encode_format_spec},
     function::Function,
     intern::{Interns, StringId},
@@ -55,6 +56,11 @@ pub struct Compiler<'a> {
 
     /// Reference to interns for string/function lookups.
     interns: &'a Interns,
+
+    /// Optional extension registry for resolving extension module imports.
+    /// When present, the compiler emits `LoadExtensionModule` for known extensions
+    /// instead of `RaiseImportError`.
+    extension_registry: Option<&'a ExtensionRegistry>,
 
     /// Compiled functions, indexed by their position in this vector.
     ///
@@ -151,6 +157,7 @@ impl<'a> Compiler<'a> {
         Self {
             code: CodeBuilder::new(),
             interns,
+            extension_registry: None,
             functions,
             loop_stack: Vec::new(),
             finally_targets: Vec::new(),
@@ -164,12 +171,16 @@ impl<'a> Compiler<'a> {
     /// Returns the compiled module Code and all compiled Functions, or a compile
     /// error if limits were exceeded. The module implicitly returns the value
     /// of the last expression, or None if empty.
+    ///
+    /// If `extension_registry` is provided, the compiler emits `LoadExtensionModule`
+    /// for known extension imports instead of `RaiseImportError`.
     pub fn compile_module(
         nodes: &[PreparedNode],
         interns: &Interns,
         num_locals: u16,
+        extension_registry: Option<&ExtensionRegistry>,
     ) -> Result<CompileResult, CompileError> {
-        Self::compile_module_with_functions(nodes, interns, num_locals, Vec::new())
+        Self::compile_module_with_functions(nodes, interns, num_locals, Vec::new(), extension_registry)
     }
 
     /// Compiles module-level code while preserving an existing function table prefix.
@@ -177,13 +188,18 @@ impl<'a> Compiler<'a> {
     /// This is used by incremental REPL compilation so previously created
     /// `FunctionId`s remain stable: new function IDs are allocated after
     /// `existing_functions.len()`.
+    ///
+    /// If `extension_registry` is provided, the compiler emits `LoadExtensionModule`
+    /// for known extension imports instead of `RaiseImportError`.
     pub fn compile_module_with_functions(
         nodes: &[PreparedNode],
         interns: &Interns,
         num_locals: u16,
         existing_functions: Vec<Function>,
+        extension_registry: Option<&ExtensionRegistry>,
     ) -> Result<CompileResult, CompileError> {
         let mut compiler = Compiler::new(interns, Vec::new());
+        compiler.extension_registry = extension_registry;
         compiler.functions = existing_functions;
         compiler.is_module_scope = true;
         compiler.compile_block(nodes)?;
@@ -584,9 +600,12 @@ impl<'a> Compiler<'a> {
 
         // Look up the module by name
         if let Some(builtin_module) = StandardLib::from_string_id(module_name) {
-            // Known module - emit LoadModule
+            // Known builtin module - emit LoadModule
             self.code.emit_u8(Opcode::LoadModule, builtin_module as u8);
-            // Store to the binding (respects Local/Global/Cell scope)
+            self.compile_store(binding);
+        } else if let Some(registry_index) = self.lookup_extension(module_name) {
+            // Known extension module - emit LoadExtensionModule
+            self.code.emit_u16(Opcode::LoadExtensionModule, registry_index);
             self.compile_store(binding);
         } else {
             // Unknown module - defer error to runtime with RaiseImportError
@@ -605,11 +624,18 @@ impl<'a> Compiler<'a> {
     fn compile_import_from(&mut self, module_name: StringId, names: &[(StringId, Identifier)], position: CodeRange) {
         self.code.set_location(position, None);
 
-        // Look up the module
-        if let Some(builtin_module) = StandardLib::from_string_id(module_name) {
-            // Known module - emit LoadModule
+        // Look up the module — builtin first, then extensions
+        let emitted_module = if let Some(builtin_module) = StandardLib::from_string_id(module_name) {
             self.code.emit_u8(Opcode::LoadModule, builtin_module as u8);
+            true
+        } else if let Some(registry_index) = self.lookup_extension(module_name) {
+            self.code.emit_u16(Opcode::LoadExtensionModule, registry_index);
+            true
+        } else {
+            false
+        };
 
+        if emitted_module {
             // For each name to import
             for (i, (import_name, binding)) in names.iter().enumerate() {
                 // Dup the module if this isn't the last import (last one consumes the module)
@@ -626,10 +652,19 @@ impl<'a> Compiler<'a> {
             }
         } else {
             // Unknown module - defer error to runtime with RaiseImportError
-            // This allows TYPE_CHECKING imports to compile without error
             let name_const = self.code.add_const(Value::InternString(module_name));
             self.code.emit_u16(Opcode::RaiseImportError, name_const);
         }
+    }
+
+    /// Looks up a module name in the extension registry.
+    ///
+    /// Returns the registry index as a u16 if the module is a registered extension,
+    /// or `None` if no extension registry is set or the module is not found.
+    fn lookup_extension(&self, module_name: StringId) -> Option<u16> {
+        let registry = self.extension_registry?;
+        let name_str = self.interns.get_str(module_name);
+        registry.lookup(name_str)
     }
 
     // ========================================================================

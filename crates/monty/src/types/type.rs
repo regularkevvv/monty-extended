@@ -71,6 +71,9 @@ pub enum Type {
     RePattern,
     /// A regex match result from `re.match()` / `re.search()` etc. - displays as "re.Match"
     ReMatch,
+    /// An opaque handle to an extension-managed object (e.g. polars DataFrame).
+    /// The display name comes from the handle's `type_name` field.
+    ExtensionHandle,
 }
 
 impl fmt::Display for Type {
@@ -113,6 +116,7 @@ impl fmt::Display for Type {
             Self::Property => f.write_str("property"),
             Self::RePattern => f.write_str("re.Pattern"),
             Self::ReMatch => f.write_str("re.Match"),
+            Self::ExtensionHandle => f.write_str("extension_handle"),
         }
     }
 }

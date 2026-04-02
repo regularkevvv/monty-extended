@@ -21,6 +21,7 @@ use crate::{
     asyncio::{Coroutine, GatherFuture, GatherItem},
     bytecode::VM,
     exception_private::{ExcType, RunResult, SimpleException},
+    extensions::ExtensionHandleData,
     heap_data::{CellValue, Closure, FunctionDefaults},
     resource::{ResourceError, ResourceTracker, check_mult_size, check_repeat_size},
     types::{
@@ -234,6 +235,7 @@ impl<'a, T: ResourceTracker> HeapReader<'a, T> {
             HeapData::DateTime(d) => HeapReadOutput::DateTime(heap_read(base, d, readers)),
             HeapData::TimeDelta(d) => HeapReadOutput::TimeDelta(heap_read(base, d, readers)),
             HeapData::TimeZone(d) => HeapReadOutput::TimeZone(heap_read(base, d, readers)),
+            HeapData::ExtensionHandle(h) => HeapReadOutput::ExtensionHandle(heap_read(base, h, readers)),
         }
     }
 
@@ -319,6 +321,7 @@ pub enum HeapReadOutput<'a> {
     DateTime(HeapRead<'a, datetime::DateTime>),
     TimeDelta(HeapRead<'a, timedelta::TimeDelta>),
     TimeZone(HeapRead<'a, timezone::TimeZone>),
+    ExtensionHandle(HeapRead<'a, ExtensionHandleData>),
 }
 
 pub struct HeapRead<'a, T: ?Sized> {

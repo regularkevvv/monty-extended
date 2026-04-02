@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    collections::HashMap,
     fmt::Write,
     mem,
     sync::{Arc, Mutex, PoisonError, atomic::AtomicBool},
@@ -7,11 +8,12 @@ use std::{
 
 // Use `::monty` to refer to the external crate (not the pymodule)
 use ::monty::{
-    ExtFunctionResult, FunctionCall, LimitedTracker, MontyException, MontyObject, MontyRun, NameLookupResult,
-    NoLimitTracker, OsCall, PrintWriter, PrintWriterCallback, ReplFunctionCall, ReplNameLookup, ReplOsCall,
-    ReplProgress, ReplResolveFutures, ReplStartError, ResolveFutures, ResourceTracker, RunProgress,
+    ExtFunctionResult, ExtensionRegistry, FunctionCall, LimitedTracker, MontyException, MontyObject, MontyRun,
+    NameLookupResult, NoLimitTracker, OsCall, PrintWriter, PrintWriterCallback, ReplFunctionCall, ReplNameLookup,
+    ReplOsCall, ReplProgress, ReplResolveFutures, ReplStartError, ResolveFutures, ResourceTracker, RunProgress,
 };
 use monty::{ExcType, NameLookup};
+use monty_extension_api::{API_VERSION, ExtFunctionDecl, ExtManifest};
 use monty_type_checking::{SourceFile, type_check};
 use pyo3::{
     IntoPyObjectExt,
@@ -39,6 +41,10 @@ use crate::{
 /// Parses and compiles Python code on initialization, then can be run
 /// multiple times with different input values. This separates the parsing
 /// cost from execution, making repeated runs more efficient.
+///
+/// Supports extensions via the `extensions` parameter in the constructor.
+/// Extensions are either native (Rust `.so`/`.dylib`) or host-backed (Python functions
+/// registered via manifests). Both use the same `import` mechanism in sandboxed code.
 #[pyclass(name = "Monty", module = "pydantic_monty")]
 #[derive(Debug)]
 pub struct PyMonty {
@@ -53,6 +59,11 @@ pub struct PyMonty {
     /// Maps type pointer identity (`u64`) to the original Python type, allowing
     /// `isinstance(result, OriginalClass)` to work correctly after round-tripping through Monty.
     dc_registry: DcRegistry,
+    /// Host extension callables, indexed by `"ext:{registry_index}:{function_name}"`.
+    ///
+    /// When the VM suspends with a host extension call, the dispatch loop looks up
+    /// the callable here and invokes it with converted arguments.
+    host_extension_callables: Option<Arc<HashMap<String, Py<PyAny>>>>,
 }
 
 #[pymethods]
@@ -65,8 +76,12 @@ impl PyMonty {
     /// * `type_check` - Whether to perform type checking on the code
     /// * `type_check_stubs` - Prefix code to be executed before type checking
     /// * `dataclass_registry` - Registry of dataclass types for reconstructing original types on output.
+    /// * `extensions` - List of extension dicts with keys: `module_name`, `functions` (list of
+    ///   `{name, is_native}` dicts), `skill` (str), `version` (str), and optionally `callables`
+    ///   (dict mapping function name → Python callable for host extensions).
     #[new]
-    #[pyo3(signature = (code, *, script_name="main.py", inputs=None, type_check=false, type_check_stubs=None, dataclass_registry=None))]
+    #[pyo3(signature = (code, *, script_name="main.py", inputs=None, type_check=false, type_check_stubs=None, dataclass_registry=None, extensions=None))]
+    #[expect(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         code: String,
@@ -75,22 +90,61 @@ impl PyMonty {
         type_check: bool,
         type_check_stubs: Option<&str>,
         dataclass_registry: Option<&Bound<'_, PyList>>,
+        extensions: Option<&Bound<'_, PyList>>,
     ) -> PyResult<Self> {
         let input_names = list_str(inputs, "inputs")?;
 
         if type_check {
-            py_type_check(py, &code, script_name, type_check_stubs)?;
+            // Collect type stubs from extensions and combine with user-provided stubs
+            // so the type checker sees extension signatures.
+            let ext_stubs = extensions
+                .filter(|list| !list.is_empty())
+                .map(|list| collect_extension_type_stubs(list))
+                .transpose()?
+                .flatten();
+
+            let combined_stubs = combine_type_stubs(type_check_stubs, ext_stubs.as_deref());
+            py_type_check(py, &code, script_name, combined_stubs.as_deref())?;
         }
 
-        // Create the snapshot (parses the code)
-        let runner = MontyRun::new(code, script_name, input_names.clone()).map_err(|e| MontyError::new_err(py, e))?;
+        // Build extension registry and host callables if extensions are provided
+        let (runner, host_callables) = if let Some(ext_list) = extensions
+            && !ext_list.is_empty()
+        {
+            let (registry, callables) = build_extension_registry(py, ext_list)?;
+            let runner = MontyRun::new_with_extensions(code, script_name, input_names.clone(), registry)
+                .map_err(|e| MontyError::new_err(py, e))?;
+            let host_callables = if callables.is_empty() {
+                None
+            } else {
+                Some(Arc::new(callables))
+            };
+            (runner, host_callables)
+        } else {
+            let runner =
+                MontyRun::new(code, script_name, input_names.clone()).map_err(|e| MontyError::new_err(py, e))?;
+            (runner, None)
+        };
 
         Ok(Self {
             runner,
             script_name: script_name.to_string(),
             input_names,
             dc_registry: DcRegistry::from_list(py, dataclass_registry)?,
+            host_extension_callables: host_callables,
         })
+    }
+
+    /// Returns the concatenated skill text from all registered extensions.
+    ///
+    /// Skills are markdown strings describing extension capabilities, designed
+    /// for injection into AI agent system prompts. Returns an empty string if
+    /// no extensions are registered or none have skills.
+    fn extension_skills(&self) -> String {
+        self.runner
+            .extension_registry()
+            .map(|r| r.extension_skills())
+            .unwrap_or_default()
     }
 
     /// Registers a dataclass type for proper isinstance() support on output.
@@ -112,6 +166,10 @@ impl PyMonty {
     /// Analyzes the code for type errors without executing it. This uses
     /// a subset of Python's type system supported by Monty.
     ///
+    /// Extension type stubs are automatically included if extensions were
+    /// registered. User-provided `prefix_code` is combined with extension
+    /// stubs.
+    ///
     /// # Args
     /// * `prefix_code` - Optional prefix to prepend to the code before type checking,
     ///   e.g. with inputs and external function signatures
@@ -121,7 +179,9 @@ impl PyMonty {
     /// * `MontyTypingError` if type errors are found
     #[pyo3(signature = (prefix_code=None))]
     fn type_check(&self, py: Python<'_>, prefix_code: Option<&str>) -> PyResult<()> {
-        py_type_check(py, self.runner.code(), &self.script_name, prefix_code)
+        let ext_stubs = self.runner.extension_registry().and_then(|r| r.extension_type_stubs());
+        let combined = combine_type_stubs(prefix_code, ext_stubs.as_deref());
+        py_type_check(py, self.runner.code(), &self.script_name, combined.as_deref())
     }
 
     /// Executes the code and returns the result.
@@ -257,6 +317,7 @@ impl PyMonty {
         let limits = limits.map(extract_limits).transpose()?;
         let dc_registry = self.dc_registry.clone_ref(py);
         let ext_fns = external_functions.map(|d| d.clone().unbind());
+        let host_callables = self.host_extension_callables.clone();
         let runner = self.runner.clone();
         if let Some(limits) = limits {
             Self::run_async_with_tracker(
@@ -267,6 +328,7 @@ impl PyMonty {
                 os,
                 dc_registry,
                 print_callback,
+                host_callables,
                 move |cancel_flag| PySignalTracker::new_with_cancellation(LimitedTracker::new(limits), cancel_flag),
             )
         } else {
@@ -278,6 +340,7 @@ impl PyMonty {
                 os,
                 dc_registry,
                 print_callback,
+                host_callables,
                 move |cancel_flag| PySignalTracker::new_with_cancellation(NoLimitTracker, cancel_flag),
             )
         }
@@ -330,6 +393,7 @@ impl PyMonty {
             script_name: serialized.script_name,
             input_names: serialized.input_names,
             dc_registry: DcRegistry::from_list(py, dataclass_registry)?,
+            host_extension_callables: None,
         })
     }
 
@@ -364,6 +428,7 @@ impl PyMonty {
         os: Option<Py<PyAny>>,
         dc_registry: DcRegistry,
         print_callback: Option<Py<PyAny>>,
+        host_extension_callables: Option<Arc<HashMap<String, Py<PyAny>>>>,
         tracker_builder: F,
     ) -> PyResult<Bound<'_, PyAny>>
     where
@@ -384,7 +449,15 @@ impl PyMonty {
             .await?
             .map_err(|e| Python::attach(|py| MontyError::new_err(py, e)))?;
 
-            let result = dispatch_loop_run(progress, external_functions, os, dc_registry, print_callback).await;
+            let result = dispatch_loop_run(
+                progress,
+                external_functions,
+                os,
+                dc_registry,
+                print_callback,
+                host_extension_callables,
+            )
+            .await;
             cancellation_guard.disarm();
             result
         })
@@ -465,7 +538,11 @@ impl PyMonty {
         // and need to be dispatched to the host.
         let has_dataclass_inputs = || input_values.iter().any(contains_dataclass);
 
-        if external_functions.is_none() && os.is_none() && !has_dataclass_inputs() {
+        if external_functions.is_none()
+            && os.is_none()
+            && !has_dataclass_inputs()
+            && self.host_extension_callables.is_none()
+        {
             return match py.detach(|| self.runner.run(input_values, tracker, print_output.reborrow())) {
                 Ok(v) => monty_to_py(py, &v, &self.dc_registry),
                 Err(err) => Err(MontyError::new_err(py, err)),
@@ -484,6 +561,16 @@ impl PyMonty {
                     // Dataclass method calls have method_call=true and the first arg is the instance
                     let return_value = if call.method_call {
                         dispatch_method_call(py, &call.function_name, &call.args, &call.kwargs, &self.dc_registry)
+                    } else if call.function_name.starts_with("ext:") {
+                        // Host extension call — dispatch via host_extension_callables
+                        dispatch_host_extension_call(
+                            py,
+                            &call.function_name,
+                            &call.args,
+                            &call.kwargs,
+                            self.host_extension_callables.as_ref(),
+                            &self.dc_registry,
+                        )
                     } else if let Some(ext_fns) = external_functions {
                         let registry = ExternalFunctionRegistry::new(py, ext_fns, &self.dc_registry);
                         registry.call(&call.function_name, &call.args, &call.kwargs)
@@ -1755,4 +1842,325 @@ where
 {
     repl_owner.get().put_repl(EitherRepl::from_core(err.repl));
     MontyError::new_err(py, err.error)
+}
+
+// ---------------------------------------------------------------------------
+// Extension helpers
+// ---------------------------------------------------------------------------
+
+/// Builds an `ExtensionRegistry` and a map of host extension callables from a Python list of extension dicts.
+///
+/// Each extension dict must have:
+/// - `module_name: str` — the module name for `import`
+/// - `functions: list[dict]` — each with `name: str` and `is_native: bool`
+/// - `skill: str` — markdown text for AI agent prompts (can be empty)
+/// - `version: str` — extension version (can be empty)
+/// - `callables: dict[str, Callable]` (optional) — Python callables for host-backed functions
+///
+/// Returns the registry and a map from `"ext:{idx}:{name}"` → `Py<PyAny>` for host dispatch.
+pub(crate) fn build_extension_registry(
+    _py: Python<'_>,
+    ext_list: &Bound<'_, PyList>,
+) -> PyResult<(ExtensionRegistry, HashMap<String, Py<PyAny>>)> {
+    use abi_stable::std_types::{ROption, RString, RVec};
+
+    let mut registry = ExtensionRegistry::new();
+    let mut host_callables = HashMap::new();
+
+    for ext_obj in ext_list.iter() {
+        let ext_dict: &Bound<'_, PyDict> = ext_obj
+            .cast::<PyDict>()
+            .map_err(|_| PyTypeError::new_err("each extension must be a dict"))?;
+
+        // Native extension: load from shared library via `library_path`
+        if let Some(lib_path_obj) = ext_dict.get_item("library_path")? {
+            let lib_path: String = lib_path_obj.extract()?;
+            load_native_extension(&mut registry, &lib_path)?;
+            continue;
+        }
+
+        let module_name: String = ext_dict
+            .get_item("module_name")?
+            .ok_or_else(|| PyKeyError::new_err("extension dict missing 'module_name'"))?
+            .extract()?;
+
+        let skill: String = ext_dict
+            .get_item("skill")?
+            .map(|v| v.extract())
+            .transpose()?
+            .unwrap_or_default();
+
+        let version: String = ext_dict
+            .get_item("version")?
+            .map(|v| v.extract())
+            .transpose()?
+            .unwrap_or_default();
+
+        let type_stub_source: Option<String> = ext_dict
+            .get_item("type_stub_source")?
+            .map(|v| v.extract())
+            .transpose()?;
+
+        // Parse function declarations
+        let functions_obj = ext_dict
+            .get_item("functions")?
+            .ok_or_else(|| PyKeyError::new_err("extension dict missing 'functions'"))?;
+        let functions_list: &Bound<'_, PyList> = functions_obj.cast::<PyList>()?;
+
+        let mut ext_functions = RVec::new();
+        for func_obj in functions_list.iter() {
+            let func_dict: &Bound<'_, PyDict> = func_obj
+                .cast::<PyDict>()
+                .map_err(|_| PyTypeError::new_err("each function must be a dict"))?;
+            let name: String = func_dict
+                .get_item("name")?
+                .ok_or_else(|| PyKeyError::new_err("function dict missing 'name'"))?
+                .extract()?;
+            let is_native: bool = func_dict
+                .get_item("is_native")?
+                .map(|v| v.extract())
+                .transpose()?
+                .unwrap_or(false);
+            ext_functions.push(ExtFunctionDecl {
+                name: RString::from(name),
+                is_native,
+            });
+        }
+
+        let manifest = ExtManifest {
+            module_name: RString::from(module_name.clone()),
+            functions: ext_functions,
+            type_stub_source: match type_stub_source {
+                Some(s) => ROption::RSome(RString::from(s)),
+                None => ROption::RNone,
+            },
+            skill: RString::from(skill),
+            version: RString::from(version),
+        };
+
+        let index = registry.register_host(manifest);
+
+        // Register host callables if provided
+        if let Some(callables_obj) = ext_dict.get_item("callables")? {
+            let callables_dict: &Bound<'_, PyDict> = callables_obj
+                .cast::<PyDict>()
+                .map_err(|_| PyTypeError::new_err("'callables' must be a dict"))?;
+            for (name, callable) in callables_dict.iter() {
+                let name_str: String = name.extract()?;
+                let key = format!("ext:{index}:{name_str}");
+                host_callables.insert(key, callable.unbind());
+            }
+        }
+    }
+
+    Ok((registry, host_callables))
+}
+
+/// Loads a native extension from a shared library (`.so`/`.dylib`) at the given path.
+///
+/// The library must export a `monty_extension_entry` symbol that returns an
+/// `ExtensionEntry` with a matching `API_VERSION`. The extension trait object
+/// is created and registered in the registry; the library handle is kept alive
+/// to prevent the shared library from being unloaded.
+fn load_native_extension(registry: &mut ExtensionRegistry, path: &str) -> PyResult<u16> {
+    // SAFETY: `libloading::Library::new` loads the shared library into the process.
+    // The library handle is kept alive by the registry to prevent the OS from
+    // unloading it while function pointers from the extension are still in use.
+    let library = unsafe { libloading::Library::new(path) }
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to load native extension from '{path}': {e}")))?;
+
+    // SAFETY: We look up the well-known `monty_extension_entry` symbol. The extension
+    // author is responsible for exporting this symbol with the correct signature
+    // (`extern "C" fn() -> ExtensionEntry`). We validate `api_version` below to
+    // guard against ABI mismatches.
+    let entry_fn = unsafe {
+        library.get::<unsafe extern "C" fn() -> monty_extension_api::ExtensionEntry>(b"monty_extension_entry")
+    }
+    .map_err(|e| {
+        PyRuntimeError::new_err(format!(
+            "native extension at '{path}' missing 'monty_extension_entry' symbol: {e}"
+        ))
+    })?;
+
+    // SAFETY: The symbol has been resolved and the library is still loaded. The
+    // function returns an `ExtensionEntry` by value (a plain C struct), so there
+    // are no lifetime concerns beyond the library staying loaded (which it does).
+    let entry = unsafe { entry_fn() };
+
+    if entry.api_version != API_VERSION {
+        return Err(PyRuntimeError::new_err(format!(
+            "native extension API version mismatch: extension has v{}, expected v{API_VERSION}",
+            entry.api_version
+        )));
+    }
+
+    let extension = (entry.create)();
+    let index = registry.register_native(extension, Some(library));
+    Ok(index)
+}
+
+/// Dispatches a host extension call to the registered Python callable.
+///
+/// The function name has the format `"ext:{registry_index}:{function_name}"`.
+/// Looks up the callable in `host_callables` and invokes it with converted arguments.
+pub(crate) fn dispatch_host_extension_call(
+    py: Python<'_>,
+    function_name: &str,
+    args: &[MontyObject],
+    kwargs: &[(MontyObject, MontyObject)],
+    host_callables: Option<&Arc<HashMap<String, Py<PyAny>>>>,
+    dc_registry: &DcRegistry,
+) -> ExtFunctionResult {
+    let Some(callables) = host_callables else {
+        return ExtFunctionResult::NotFound(function_name.to_string());
+    };
+
+    let Some(callable) = callables.get(function_name) else {
+        return ExtFunctionResult::NotFound(function_name.to_string());
+    };
+
+    // Convert args to Python
+    let py_args: Vec<Py<PyAny>> = match args
+        .iter()
+        .map(|arg| monty_to_py(py, arg, dc_registry))
+        .collect::<PyResult<_>>()
+    {
+        Ok(args) => args,
+        Err(err) => return exc_py_to_monty(py, &err).into(),
+    };
+
+    let py_args_tuple = match PyTuple::new(py, py_args) {
+        Ok(t) => t,
+        Err(err) => return exc_py_to_monty(py, &err).into(),
+    };
+
+    // Convert kwargs to Python dict
+    let py_kwargs = PyDict::new(py);
+    for (k, v) in kwargs {
+        match (monty_to_py(py, k, dc_registry), monty_to_py(py, v, dc_registry)) {
+            (Ok(pk), Ok(pv)) => {
+                if let Err(err) = py_kwargs.set_item(pk, pv) {
+                    return exc_py_to_monty(py, &err).into();
+                }
+            }
+            (Err(err), _) | (_, Err(err)) => return exc_py_to_monty(py, &err).into(),
+        }
+    }
+
+    // Parse registry index from the function name ("ext:<idx>:<name>")
+    let registry_index = function_name
+        .strip_prefix("ext:")
+        .and_then(|rest| rest.split(':').next())
+        .and_then(|idx| idx.parse::<u16>().ok());
+
+    // Call the Python callable
+    match callable.bind(py).call(&py_args_tuple, Some(&py_kwargs)) {
+        Ok(result) => match py_to_monty(&result, dc_registry) {
+            Ok(obj) => {
+                // Detect handle dicts and convert to ExtensionHandle for method syntax support.
+                let obj = maybe_convert_handle_dict(obj, registry_index);
+                ExtFunctionResult::Return(obj)
+            }
+            Err(err) => exc_py_to_monty(py, &err).into(),
+        },
+        Err(err) => exc_py_to_monty(py, &err).into(),
+    }
+}
+
+/// Converts a `MontyObject::Dict` to `MontyObject::ExtensionHandle` if it looks
+/// like a handle dict (has `handle_id`, `type_name`, and `extension_id` keys).
+///
+/// This allows host extension handles returned via `HandleStore.register()` to
+/// become proper `ExtensionHandle` objects on the VM heap, enabling method syntax
+/// (`handle.method()`) instead of only module-level functions.
+fn maybe_convert_handle_dict(obj: MontyObject, registry_index: Option<u16>) -> MontyObject {
+    let Some(registry_index) = registry_index else {
+        return obj;
+    };
+
+    let MontyObject::Dict(ref pairs) = obj else {
+        return obj;
+    };
+
+    // Look for handle_id, type_name, extension_id keys
+    let mut handle_id: Option<u64> = None;
+    let mut type_name: Option<String> = None;
+    let mut has_extension_id = false;
+
+    for (key, value) in pairs {
+        if let MontyObject::String(k) = key {
+            match k.as_str() {
+                "handle_id" => {
+                    if let MontyObject::Int(id) = value {
+                        handle_id = Some((*id).cast_unsigned());
+                    }
+                }
+                "type_name" => {
+                    if let MontyObject::String(name) = value {
+                        type_name = Some(name.clone());
+                    }
+                }
+                "extension_id" => {
+                    has_extension_id = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let (Some(handle_id), Some(type_name)) = (handle_id, type_name)
+        && has_extension_id
+    {
+        return MontyObject::ExtensionHandle {
+            registry_index,
+            type_name,
+            handle_id,
+        };
+    }
+
+    obj
+}
+
+/// Extracts type stub strings from extension dicts before the registry is built.
+///
+/// Called during `PyMonty::new()` so that type checking can see extension
+/// signatures even though the registry has not been constructed yet.
+fn collect_extension_type_stubs(ext_list: &Bound<'_, PyList>) -> PyResult<Option<String>> {
+    let mut stubs = Vec::new();
+    for ext_obj in ext_list.iter() {
+        let ext_dict: &Bound<'_, PyDict> = ext_obj
+            .cast::<PyDict>()
+            .map_err(|_| PyTypeError::new_err("each extension must be a dict"))?;
+        if let Some(stub_obj) = ext_dict.get_item("type_stub_source")? {
+            let stub: String = stub_obj.extract()?;
+            if !stub.is_empty() {
+                stubs.push(stub);
+            }
+        }
+    }
+    if stubs.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(stubs.join("\n")))
+    }
+}
+
+/// Combines user-provided type stubs with extension type stubs.
+///
+/// Returns `None` if both inputs are `None`. When both are present they
+/// are concatenated with a newline separator, extension stubs first so
+/// that user stubs can reference extension types.
+fn combine_type_stubs(user_stubs: Option<&str>, ext_stubs: Option<&str>) -> Option<String> {
+    match (ext_stubs, user_stubs) {
+        (None, None) => None,
+        (Some(ext), None) => Some(ext.to_string()),
+        (None, Some(user)) => Some(user.to_string()),
+        (Some(ext), Some(user)) => {
+            let mut combined = String::with_capacity(ext.len() + 1 + user.len());
+            combined.push_str(ext);
+            combined.push('\n');
+            combined.push_str(user);
+            Some(combined)
+        }
+    }
 }

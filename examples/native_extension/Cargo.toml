@@ -1,0 +1,12 @@
+[package]
+name = "monty-ext-datatools"
+version = "0.1.0"
+edition = "2024"
+description = "Example native Monty extension providing in-memory CSV/DataFrame operations."
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+monty-extension-api = { path = "../../crates/monty-extension-api" }

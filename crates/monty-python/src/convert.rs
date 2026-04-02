@@ -253,6 +253,18 @@ pub fn monty_to_py(py: Python<'_>, obj: &MontyObject, dc_registry: &DcRegistry) 
             let path_obj = pure_posix_path.call1((p,))?;
             Ok(path_obj.into_any().unbind())
         }
+        MontyObject::ExtensionHandle {
+            registry_index,
+            type_name,
+            handle_id,
+        } => {
+            let dict = PyDict::new(py);
+            dict.set_item("handle_id", handle_id)?;
+            dict.set_item("type_name", type_name)?;
+            dict.set_item("extension_id", "")?;
+            dict.set_item("registry_index", registry_index)?;
+            Ok(dict.into_any().unbind())
+        }
         // Output-only types - convert to string representation
         MontyObject::Repr(s) => Ok(PyString::new(py, s).into_any().unbind()),
         MontyObject::Cycle(_, placeholder) => Ok(PyString::new(py, placeholder).into_any().unbind()),

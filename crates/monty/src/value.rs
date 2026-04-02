@@ -18,6 +18,7 @@ use crate::{
     builtins::Builtins,
     bytecode::{CallResult, VM},
     exception_private::{ExcType, RunError, RunResult, SimpleException},
+    extensions::ExtensionFunctionId,
     heap::{ContainsHeap, DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapReadOutput},
     intern::{BytesId, FunctionId, Interns, LongIntId, StaticStrings, StringId},
     modules::ModuleFunctions,
@@ -90,6 +91,13 @@ pub(crate) enum Value {
     /// already-awaited ExternalFuture raises RuntimeError.
     ExternalFuture(CallId),
 
+    /// A function from a registered extension module.
+    ///
+    /// Created when an extension module is imported and its attributes are accessed.
+    /// The `ExtensionFunctionId` encodes the registry index, function index, name,
+    /// and whether the function is native (direct Rust call) or host-backed (VM suspends).
+    ExtensionFunction(ExtensionFunctionId),
+
     // Heap-allocated values (stored in arena)
     Ref(HeapId),
 
@@ -138,7 +146,7 @@ impl PyTrait<'_> for Value {
             Self::InternBytes(_) => Type::Bytes,
             Self::Builtin(c) => c.py_type(),
             Self::ModuleFunction(_) => Type::BuiltinFunction,
-            Self::DefFunction(_) | Self::ExtFunction(_) => Type::Function,
+            Self::DefFunction(_) | Self::ExtFunction(_) | Self::ExtensionFunction(_) => Type::Function,
             Self::Marker(m) => m.py_type(),
             Self::Property(_) => Type::Property,
             Self::ExternalFuture(_) => Type::Coroutine,
@@ -339,10 +347,10 @@ impl PyTrait<'_> for Value {
             // InternLongInt is always truthy (if it were zero, it would fit in i64)
             Self::InternLongInt(_) => true,
             Self::Builtin(_) | Self::ModuleFunction(_) => true, // Builtins are always truthy
-            Self::DefFunction(_) | Self::ExtFunction(_) => true, // Functions are always truthy
-            Self::Marker(_) => true,                            // Markers are always truthy
-            Self::Property(_) => true,                          // Properties are always truthy
-            Self::ExternalFuture(_) => true,                    // ExternalFutures are always truthy
+            Self::DefFunction(_) | Self::ExtFunction(_) | Self::ExtensionFunction(_) => true,
+            Self::Marker(_) => true,         // Markers are always truthy
+            Self::Property(_) => true,       // Properties are always truthy
+            Self::ExternalFuture(_) => true, // ExternalFutures are always truthy
             Self::InternString(string_id) => !vm.interns.get_str(*string_id).is_empty(),
             Self::InternBytes(bytes_id) => !vm.interns.get_bytes(*bytes_id).is_empty(),
             Self::Ref(id) => vm.heap.read(*id).py_bool(vm),
@@ -382,6 +390,11 @@ impl PyTrait<'_> for Value {
             Self::ModuleFunction(mf) => Ok(mf.py_repr_fmt(f, self.id())?),
             Self::DefFunction(f_id) => Ok(interns.get_function(*f_id).py_repr_fmt(f, interns, self.id())?),
             Self::ExtFunction(name_id) => Ok(write!(f, "<function '{}' external>", interns.get_str(*name_id))?),
+            Self::ExtensionFunction(ef) => Ok(write!(
+                f,
+                "<function '{}' extension>",
+                interns.get_str(ef.function_name)
+            )?),
             Self::InternString(string_id) => Ok(string_repr_fmt(interns.get_str(*string_id), f)?),
             Self::InternBytes(bytes_id) => Ok(bytes_repr_fmt(interns.get_bytes(*bytes_id), f)?),
             Self::Marker(m) => Ok(m.py_repr_fmt(f)?),
@@ -1381,7 +1394,9 @@ impl Value {
             Self::InternString(_) => Type::Str,
             Self::InternBytes(_) => Type::Bytes,
             Self::Builtin(_) => Type::BuiltinFunction,
-            Self::ModuleFunction(_) | Self::DefFunction(_) | Self::ExtFunction(_) => Type::Function,
+            Self::ModuleFunction(_) | Self::DefFunction(_) | Self::ExtFunction(_) | Self::ExtensionFunction(_) => {
+                Type::Function
+            }
             Self::Marker(_) => Type::SpecialForm,
             Self::Property(_) => Type::Property,
             Self::ExternalFuture(_) => Type::Coroutine,
@@ -1430,6 +1445,7 @@ impl Value {
             Self::ModuleFunction(mf) => module_function_value_id(*mf),
             Self::DefFunction(f_id) => function_value_id(*f_id),
             Self::ExtFunction(name_id) => ext_function_value_id(*name_id),
+            Self::ExtensionFunction(ef) => ext_function_value_id(ef.function_name),
             // Markers get deterministic IDs based on discriminant
             Self::Marker(m) => marker_value_id(*m),
             // Properties get deterministic IDs based on discriminant
@@ -1522,6 +1538,7 @@ impl Value {
             // Hash functions based on function ID
             Self::DefFunction(f_id) => f_id.hash(&mut hasher),
             Self::ExtFunction(name_id) => name_id.hash(&mut hasher),
+            Self::ExtensionFunction(ef) => ef.hash(&mut hasher),
             // Markers are hashable based on their discriminant (already included above)
             Self::Marker(m) => m.hash(&mut hasher),
             // Properties are hashable based on their OS function discriminant
@@ -1955,6 +1972,7 @@ impl Value {
             Self::ModuleFunction(mf) => Self::ModuleFunction(*mf),
             Self::DefFunction(f) => Self::DefFunction(*f),
             Self::ExtFunction(f) => Self::ExtFunction(*f),
+            Self::ExtensionFunction(ef) => Self::ExtensionFunction(*ef),
             Self::InternString(s) => Self::InternString(*s),
             Self::InternBytes(b) => Self::InternBytes(*b),
             Self::InternLongInt(bi) => Self::InternLongInt(*bi),

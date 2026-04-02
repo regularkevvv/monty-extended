@@ -7,9 +7,12 @@ members = [
     "crates/monty-js",
     "crates/monty-type-checking",
     "crates/monty-typeshed",
+    "crates/monty-extension-api",
+    "crates/monty-extension-macros",
     "crates/fuzz"
 ]
 default-members = ["crates/monty-cli"]
+exclude = ["examples/native_extension"]
 
 [workspace.package]
 edition = "2024"

@@ -8,7 +8,7 @@
 //! VM resume calls are offloaded to `spawn_blocking()` to avoid
 //! blocking the Python event loop.
 
-use std::mem::drop;
+use std::{collections::HashMap, mem::drop, sync::Arc};
 
 use monty::{
     ExcType, ExtFunctionResult, MontyException, MontyObject, MontyRepl, NameLookupResult, OsFunction, PrintWriter,
@@ -33,7 +33,7 @@ use crate::{
         CallResult, ExternalFunctionRegistry, dispatch_method_call_or_coroutine, py_err_to_ext_result,
         py_obj_to_ext_result,
     },
-    monty_cls::CallbackStringPrint,
+    monty_cls::{CallbackStringPrint, dispatch_host_extension_call},
     repl::{EitherRepl, FromCoreRepl, PyMontyRepl},
 };
 
@@ -131,6 +131,7 @@ pub(crate) async fn dispatch_loop_run<T: ResourceTracker + Send + 'static>(
     os: Option<Py<PyAny>>,
     dc_registry: DcRegistry,
     print_callback: Option<Py<PyAny>>,
+    host_extension_callables: Option<Arc<HashMap<String, Py<PyAny>>>>,
 ) -> PyResult<Py<PyAny>> {
     let mut join_set: JoinSet<(u32, ExtFunctionResult)> = JoinSet::new();
 
@@ -146,6 +147,7 @@ pub(crate) async fn dispatch_loop_run<T: ResourceTracker + Send + 'static>(
                     &call.args,
                     &call.kwargs,
                     external_functions.as_ref(),
+                    host_extension_callables.as_ref(),
                     &dc_registry,
                 );
 
@@ -223,12 +225,14 @@ where
                 });
             }
             ReplProgress::FunctionCall(call) => {
+                // REPL does not yet support host extension callables — pass None.
                 let call_result = dispatch_function_call(
                     &call.function_name,
                     call.method_call,
                     &call.args,
                     &call.kwargs,
                     external_functions.as_ref(),
+                    None,
                     &dc_registry,
                 );
 
@@ -332,11 +336,17 @@ fn dispatch_function_call(
     args: &[MontyObject],
     kwargs: &[(MontyObject, MontyObject)],
     external_functions: Option<&Py<PyDict>>,
+    host_extension_callables: Option<&Arc<HashMap<String, Py<PyAny>>>>,
     dc_registry: &DcRegistry,
 ) -> CallResult {
     Python::attach(|py| {
         if method_call {
             dispatch_method_call_or_coroutine(py, function_name, args, kwargs, dc_registry)
+        } else if function_name.starts_with("ext:") {
+            // Host extension call — dispatch via host_extension_callables
+            let result =
+                dispatch_host_extension_call(py, function_name, args, kwargs, host_extension_callables, dc_registry);
+            CallResult::Sync(result)
         } else if let Some(ext_fns) = external_functions {
             let ext_fns = ext_fns.bind(py);
             let registry = ExternalFunctionRegistry::new(py, ext_fns, dc_registry);

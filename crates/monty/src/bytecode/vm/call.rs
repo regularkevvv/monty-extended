@@ -6,6 +6,9 @@
 
 use std::mem;
 
+use abi_stable::std_types::{RResult, RVec};
+use monty_extension_api::ExtArgs;
+
 use super::{CallFrame, VM};
 use crate::{
     args::{ArgValues, KwargsValues},
@@ -14,6 +17,7 @@ use crate::{
     bytecode::FrameExit,
     defer_drop,
     exception_private::{ExcType, RunError},
+    extensions::{ExtensionFunctionId, ExtensionHandleData, ext_to_value, value_to_ext},
     heap::{DropWithHeap, HeapData, HeapGuard, HeapId},
     heap_data::CellValue,
     intern::{FunctionId, StringId},
@@ -365,6 +369,10 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                 // External function - return to caller to execute
                 Ok(CallResult::External(EitherStr::Interned(*name_id), args))
             }
+            Value::ExtensionFunction(ef) => {
+                // Extension function - native dispatch or host suspension
+                self.call_extension_function(*ef, args)
+            }
             Value::DefFunction(func_id) => {
                 // Defined function without defaults or captured variables
                 self.call_def_function(*func_id, &[], &[], args)
@@ -378,6 +386,161 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                 let ty = callable.py_type(self);
                 Err(ExcType::type_error(format!("'{ty}' object is not callable")))
             }
+        }
+    }
+
+    /// Dispatches a call to an extension function.
+    ///
+    /// For native functions (`is_native: true`), converts args to `ExtValue`,
+    /// calls the extension directly via the registry, and converts the result back.
+    /// For host functions (`is_native: false`), yields `CallResult::External` with
+    /// a prefixed name so the host can route the call to the correct extension.
+    /// Dispatches a call to an extension function.
+    ///
+    /// For native functions (`is_native: true`), converts args to `ExtValue`,
+    /// calls the extension directly via the registry, and converts the result back.
+    /// For host functions (`is_native: false`), yields `CallResult::External` with
+    /// a prefixed name so the host can route the call to the correct extension.
+    fn call_extension_function(&mut self, ef: ExtensionFunctionId, args: ArgValues) -> Result<CallResult, RunError> {
+        if ef.is_native {
+            // Convert positional and keyword args to ExtValue
+            let (mut pos_iter, kwargs) = args.into_parts();
+            let mut ext_positional = RVec::new();
+            for value in pos_iter.by_ref() {
+                let ext = value_to_ext(&value, self)?;
+                value.drop_with_heap(self);
+                ext_positional.push(ext);
+            }
+
+            let mut ext_keyword = RVec::new();
+            for (key, value) in kwargs {
+                let key_str = if let Value::InternString(id) = &key {
+                    self.interns.get_str(*id).to_string()
+                } else {
+                    key.drop_with_heap(self);
+                    value.drop_with_heap(self);
+                    return Err(ExcType::type_error("keyword argument names must be strings"));
+                };
+                key.drop_with_heap(self);
+                let ext = value_to_ext(&value, self)?;
+                value.drop_with_heap(self);
+                ext_keyword.push(monty_extension_api::ExtKeyValue {
+                    key: key_str.into(),
+                    value: ext,
+                });
+            }
+
+            let registry = self.extension_registry.expect("extension call requires a registry");
+
+            let ext_args = ExtArgs {
+                positional: ext_positional,
+                keyword: ext_keyword,
+            };
+
+            // Snapshot the current resource budget so the extension can cooperatively
+            // check limits during long-running operations.
+            let budget = self.heap.tracker().resource_budget();
+
+            match registry.call_native(&ef, ext_args, self.interns, budget) {
+                RResult::ROk(ext_value) => {
+                    // Check time after native call returns — the extension may have
+                    // consumed significant wall-clock time.
+                    self.heap.tracker().check_time()?;
+                    let value = ext_to_value(ext_value, ef.registry_index, self)?;
+                    Ok(CallResult::Value(value))
+                }
+                RResult::RErr(ext_error) => {
+                    // Map extension error type to the appropriate Python exception
+                    Err(ExcType::type_error(ext_error.message.to_string()))
+                }
+            }
+        } else {
+            // Host function — yield to host via existing external call mechanism.
+            // Prefix the name with "ext:<registry_index>:" so the host can identify it.
+            let func_name = self.interns.get_str(ef.function_name);
+            let prefixed_name = format!("ext:{}:{func_name}", ef.registry_index);
+            Ok(CallResult::External(EitherStr::Heap(prefixed_name), args))
+        }
+    }
+
+    /// Dispatches a method call on an extension handle.
+    ///
+    /// For native extensions, converts args to `ExtValue`, calls the extension's
+    /// `call_method` trait method, and converts the result back. For host extensions,
+    /// yields `CallResult::External` with a `"ext-method:<idx>:<method>"` prefix so the
+    /// host can dispatch the call, with the handle prepended as the first positional arg.
+    /// Dispatches a method call on an extension handle.
+    ///
+    /// For native extensions, converts args to `ExtValue`, calls the extension's
+    /// `call_method` trait method, and converts the result back. For host extensions,
+    /// prepends the handle as the first positional arg and yields `CallResult::External`
+    /// with an `"ext:<idx>:<method>"` name so the existing host dispatch loop handles it.
+    ///
+    /// `handle_heap_id` is the `HeapId` of the `ExtensionHandle` on the heap. For host
+    /// calls, it's prepended to the args so the host can identify which object the
+    /// method is being called on.
+    pub(crate) fn call_extension_method(
+        &mut self,
+        handle_data: &ExtensionHandleData,
+        handle_heap_id: HeapId,
+        method_name: &str,
+        args: ArgValues,
+    ) -> Result<CallResult, RunError> {
+        let registry = self
+            .extension_registry
+            .expect("extension method call requires a registry");
+        let is_native = registry.is_native(handle_data.registry_index);
+
+        if is_native {
+            let (mut pos_iter, kwargs) = args.into_parts();
+            let mut ext_positional = RVec::new();
+            for value in pos_iter.by_ref() {
+                let ext = value_to_ext(&value, self)?;
+                value.drop_with_heap(self);
+                ext_positional.push(ext);
+            }
+
+            let mut ext_keyword = RVec::new();
+            for (key, value) in kwargs {
+                let key_str = if let Value::InternString(id) = &key {
+                    self.interns.get_str(*id).to_string()
+                } else {
+                    key.drop_with_heap(self);
+                    value.drop_with_heap(self);
+                    return Err(ExcType::type_error("keyword argument names must be strings"));
+                };
+                key.drop_with_heap(self);
+                let ext = value_to_ext(&value, self)?;
+                value.drop_with_heap(self);
+                ext_keyword.push(monty_extension_api::ExtKeyValue {
+                    key: key_str.into(),
+                    value: ext,
+                });
+            }
+
+            let ext_args = ExtArgs {
+                positional: ext_positional,
+                keyword: ext_keyword,
+            };
+            let budget = self.heap.tracker().resource_budget();
+
+            match registry.call_method_native(handle_data, method_name, ext_args, budget) {
+                RResult::ROk(ext_value) => {
+                    self.heap.tracker().check_time()?;
+                    let value = ext_to_value(ext_value, handle_data.registry_index, self)?;
+                    Ok(CallResult::Value(value))
+                }
+                RResult::RErr(ext_error) => Err(ExcType::type_error(ext_error.message.to_string())),
+            }
+        } else {
+            // Host method call — prepend the handle as the first arg and use the
+            // same "ext:" prefix so the existing host dispatch loop handles it.
+            // Clone with heap to increment the refcount since we're creating a
+            // second reference to the same heap entry.
+            let handle_ref = Value::Ref(handle_heap_id).clone_with_heap(self.heap);
+            let args = args.prepend(handle_ref);
+            let prefixed_name = format!("ext:{}:{method_name}", handle_data.registry_index);
+            Ok(CallResult::External(EitherStr::Heap(prefixed_name), args))
         }
     }
 

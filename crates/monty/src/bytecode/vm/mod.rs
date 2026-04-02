@@ -27,6 +27,7 @@ use crate::{
         op::Opcode,
     },
     exception_private::{ExcType, RunError, RunResult, SimpleException},
+    extensions::ExtensionRegistry,
     heap::{ContainsHeap, DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapReadOutput, HeapReader},
     heap_data::{Closure, FunctionDefaults},
     intern::{FunctionId, Interns, StringId},
@@ -583,6 +584,12 @@ pub struct VM<'h, 'a, T: ResourceTracker> {
     /// back to a `NameError`, so the traceback points to the name reference rather than
     /// the call expression.
     ext_function_load_ip: Option<usize>,
+
+    /// Optional extension registry for loading extension modules and calling native functions.
+    ///
+    /// Set when extensions are registered. The VM uses this to create extension modules
+    /// when `LoadExtensionModule` is executed and to dispatch native extension function calls.
+    pub(crate) extension_registry: Option<&'a ExtensionRegistry>,
 }
 
 impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
@@ -605,6 +612,7 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
             scheduler: Scheduler::new(),
             ext_function_load_ip: None, // Set by LoadGlobalCallable/LoadLocalCallable
             module_code: None,
+            extension_registry: None,
         }
     }
 
@@ -666,6 +674,7 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
             scheduler: snapshot.scheduler,
             module_code: Some(module_code),
             ext_function_load_ip: None,
+            extension_registry: None,
         }
     }
     /// Consumes the VM and creates a snapshot for pause/resume.
@@ -1541,6 +1550,10 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                     let error = ExcType::module_not_found_error(name_str);
                     catch_sync!(self, cached_frame, error);
                 }
+                Opcode::LoadExtensionModule => {
+                    let registry_index = fetch_u16!(cached_frame);
+                    try_catch_sync!(self, cached_frame, self.load_extension_module(registry_index));
+                }
             }
         }
     }
@@ -1551,6 +1564,19 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
 
         // Create the module on the heap using pre-interned strings
         let heap_id = module.create(self)?;
+        self.push(Value::Ref(heap_id));
+        Ok(())
+    }
+
+    /// Loads an extension module and pushes it onto the stack.
+    ///
+    /// Creates the module from the extension registry, populating it with
+    /// `ExtensionFunction` values for each declared function.
+    fn load_extension_module(&mut self, registry_index: u16) -> RunResult<()> {
+        let registry = self
+            .extension_registry
+            .expect("LoadExtensionModule requires an extension registry");
+        let heap_id = registry.create_module(registry_index, self)?;
         self.push(Value::Ref(heap_id));
         Ok(())
     }
