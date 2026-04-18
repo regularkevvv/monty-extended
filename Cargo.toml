@@ -5,6 +5,8 @@ members = [
     "crates/monty-cli",
     "crates/monty-python",
     "crates/monty-js",
+    "crates/monty-datatest",
+    "crates/monty-bench",
     "crates/monty-type-checking",
     "crates/monty-typeshed",
     "crates/monty-extension-api",
@@ -16,7 +18,7 @@ exclude = ["examples/native_extension"]
 
 [workspace.package]
 edition = "2024"
-version = "0.0.9"
+version = "0.0.15"
 rust-version = "1.90"
 license = "MIT"
 authors = ["Samuel Colvin <samuel@pydantic.dev>"]
@@ -61,6 +63,7 @@ num-integer = "0.1"
 # others
 indexmap = { version = "2.9", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 postcard = { version = "1.1", features = ["alloc"] }
 sha2 = "0.10"
 pretty_assertions = "1.4"

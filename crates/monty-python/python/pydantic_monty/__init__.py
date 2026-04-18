@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
-from typing_extensions import deprecated
+from typing_extensions import NotRequired, TypedDict, deprecated
 
 if TYPE_CHECKING:
     from types import EllipsisType
 
 from ._monty import (
+    NOT_HANDLED,
+    CollectStreams,
+    CollectString,
     Frame,
     FunctionSnapshot,
     FutureSnapshot,
@@ -18,6 +21,7 @@ from ._monty import (
     MontyRuntimeError,
     MontySyntaxError,
     MontyTypingError,
+    MountDir,
     NameLookupSnapshot,
     __version__,
     load_repl_snapshot,
@@ -26,7 +30,15 @@ from ._monty import (
 from .decorators import MontyModule
 from .enforcement import enforce_call_count, enforce_size, enforce_timeout
 from .handles import HandleStore
-from .os_access import AbstractFile, AbstractOS, CallbackFile, MemoryFile, OSAccess, OsFunction, StatResult
+from .os_access import (
+    AbstractFile,
+    AbstractOS,
+    CallbackFile,
+    MemoryFile,
+    OSAccess,
+    OsFunction,
+    StatResult,
+)
 
 __all__ = (
     # this file
@@ -36,6 +48,8 @@ __all__ = (
     'ResourceLimits',
     # _monty
     '__version__',
+    'CollectStreams',
+    'CollectString',
     'Monty',
     'MontyRepl',
     'MontyComplete',
@@ -47,11 +61,13 @@ __all__ = (
     'MontyRuntimeError',
     'MontyTypingError',
     'Frame',
+    'MountDir',
     'load_snapshot',
     'load_repl_snapshot',
     # os_access
     'StatResult',
     'OsFunction',
+    'NOT_HANDLED',
     'AbstractOS',
     'AbstractFile',
     'MemoryFile',
@@ -73,7 +89,7 @@ async def run_monty_async(
     inputs: dict[str, Any] | None = None,
     external_functions: dict[str, Callable[..., Any]] | None = None,
     limits: ResourceLimits | None = None,
-    print_callback: Callable[[Literal['stdout'], str], None] | None = None,
+    print_callback: Callable[[Literal['stdout'], str], None] | CollectStreams | CollectString | None = None,
     os: AbstractOS | None = None,
 ) -> Any:
     return await monty_runner.run_async(
@@ -92,7 +108,7 @@ async def run_repl_async(
     *,
     inputs: dict[str, Any] | None = None,
     external_functions: dict[str, Callable[..., Any]] | None = None,
-    print_callback: Callable[[Literal['stdout'], str], None] | None = None,
+    print_callback: Callable[[Literal['stdout'], str], None] | CollectStreams | CollectString | None = None,
     os: AbstractOS | None = None,
 ) -> Any:
     return await repl.feed_run_async(
@@ -128,15 +144,81 @@ class ResourceLimits(TypedDict, total=False):
 
 
 class ExternalReturnValue(TypedDict):
+    """Represents the return value of an external function call."""
+
     return_value: Any
 
 
 class ExternalException(TypedDict):
+    """Represents an exception raised during an external function call."""
+
     exception: Exception
 
 
+ExcType = Literal[
+    'Exception',
+    'BaseException',
+    'SystemExit',
+    'KeyboardInterrupt',
+    'ArithmeticError',
+    'OverflowError',
+    'ZeroDivisionError',
+    'LookupError',
+    'IndexError',
+    'KeyError',
+    'RuntimeError',
+    'NotImplementedError',
+    'RecursionError',
+    'AttributeError',
+    'FrozenInstanceError',
+    'NameError',
+    'UnboundLocalError',
+    'ValueError',
+    'UnicodeDecodeError',
+    'json.JSONDecodeError',
+    'ImportError',
+    'ModuleNotFoundError',
+    'OSError',
+    'FileNotFoundError',
+    'FileExistsError',
+    'IsADirectoryError',
+    'NotADirectoryError',
+    'PermissionError',
+    'AssertionError',
+    'MemoryError',
+    'StopIteration',
+    'SyntaxError',
+    'TimeoutError',
+    'TypeError',
+    're.PatternError',
+]
+"""String names of Python exception types that Monty understands.
+
+Used by `ExternalExceptionData` to identify an exception by name rather than
+passing a concrete Python exception instance. Names match Python's built-in
+exception classes, except for `json.JSONDecodeError` and `re.PatternError`
+which are dotted to disambiguate from their `ValueError` / `Exception`
+parents.
+"""
+
+
+class ExternalExceptionData(TypedDict):
+    """Represents an exception raised during an external function call by its type and optional message.
+
+    Prefer this variant over `ExternalException` when the caller does not have
+    (or does not want to construct) a concrete Python exception instance —
+    e.g. when resuming a snapshot from a worker process where the original
+    exception type is not available, or when resuming from another language.
+    """
+
+    exc_type: ExcType
+    message: NotRequired[str]
+
+
 class ExternalFuture(TypedDict):
+    """Represents a pending future returned from an external function call."""
+
     future: EllipsisType
 
 
-ExternalResult = ExternalReturnValue | ExternalException | ExternalFuture
+ExternalResult = ExternalReturnValue | ExternalException | ExternalExceptionData | ExternalFuture

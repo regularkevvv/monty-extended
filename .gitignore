@@ -21,3 +21,4 @@
 /.worktrees/
 /.zed/
 __pycache__/
+/scripts/json_files/

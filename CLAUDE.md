@@ -12,7 +12,22 @@ Project goals:
 - **Performance**: Fast execution through compile-time optimizations and efficient memory layout
 - **Simplicity**: Clean, understandable implementation focused on a Python subset
 - **Snapshotting and iteration**: Plan is to allow code to be iteratively executed and snapshotted at each function call
+- **Cross-platform**: Runs on Linux, macOS, and Windows (and any other OS that can run Rust)
 - Targets the latest stable version of Python, currently Python 3.14
+
+## Cross-Platform Requirements
+
+Monty must work identically on Linux, macOS, and Windows. Within the Monty sandbox,
+paths always use POSIX/Linux-style forward slashes (`/`) regardless of the host OS.
+The `MountTable` handles translating between virtual POSIX paths and host-native paths.
+
+Key rules:
+- **Virtual paths** are always POSIX-style (`/mnt/data/file.txt`), never Windows-style
+- **Host paths** use `std::path::Path`/`PathBuf` which handles OS differences automatically
+- Avoid `#[cfg(unix)]`-only code in the main crate — all features must work on all platforms
+- Tests in `crates/monty/tests/` should be cross-platform; use helper functions for
+  OS-specific APIs like symlink creation (see `symlink_file`/`symlink_dir` in `fs_security.rs`)
+- CI runs `cargo test -p monty --features ref-count-panic` on Linux, macOS, and Windows
 
 ## Important Security Notice
 
@@ -36,6 +51,27 @@ Possible security risks to consider:
 * regex/string DoS - catastrophic backtracking or operations bypassing limits
 * information leakage via timing or error messages
 * Python/Javascript/Rust APIs that accidentally allow developers to expose their host to monty code
+
+## Filesystem Mounts (`crates/monty/src/fs/`)
+
+The `MountTable` allows mounting real host directories into the sandbox at virtual paths,
+with configurable access modes (ReadWrite, ReadOnly, OverlayMemory).
+
+**CRITICAL SECURITY INVARIANT:** The monty runtime MUST NEVER read, write, or
+obtain any information about any file or directory outside the specific directory
+that is mounted. This is enforced by:
+
+- Path canonicalization after mapping virtual → host paths
+- Boundary checks verifying canonical paths remain within the mount
+- Symlink resolution that rejects links pointing outside the mount
+- Virtual-space normalization that prevents `..` escape
+- `Resolve` and `Absolute` returning virtual paths, never host paths
+- Null byte rejection in all paths
+
+All path resolution goes through `fs::path_security::resolve_path()` which is
+the sole security boundary. **Changes to `path_security.rs` require careful security review.**
+
+`heap.rs` and `path_security.rs` are the two most security-critical files in the codebase.
 
 ## Bytecode VM Architecture
 
@@ -222,6 +258,25 @@ Avoid `fn my_func<T: MyTrait>(..., param: T)` style function definitions, STRONG
 
 Also avoid using functions and structs via a path like `std::borrow::Cow::Owned(...)`, instead import `Cow` globally with `use std::borrow::Cow;`.
 
+STRONGLY prefer expression-oriented style: use `if`/`match` as expressions with a trailing (tail) expression rather than early `return` with a guard clause. E.g. prefer
+
+```rs
+if cond { a } else { b }
+```
+
+over
+
+```rs
+if cond {
+    return a;
+}
+b
+```
+
+This applies to function bodies and block expressions alike. Only use early `return` when it genuinely simplifies control flow (e.g. several guard clauses at the top of a function).
+
+This applies even more strongly to long `if cond { ... } else if cond2 { ... } ... else { ... }` chains — keep them as a single expression yielding a value, rather than scattering `return` statements through each branch.
+
 NEVER use `allow()` in rust lint markers, instead use `expect()` so any unnecessary markers are removed. E.g. use
 
 ```rs
@@ -274,7 +329,8 @@ make test-ref-count-panic
 make test-cases
 
 # Run a specific test
-cargo test -p monty --test datatest_runner --features ref-count-panic str__ops
+cargo test -p monty --test TEST --features ref-count-panic str__ops
+cargo run -p monty-datatest --features ref-count-panic str__ops
 
 # Run the interpreter on a Python file
 cargo run -- <file.py>
@@ -422,7 +478,7 @@ All these markers must be at the start of comment lines to be recognized.
 - The ONLY exception is `await` expressions outside of async functions, where you should add `# pyright: ignore`
 - Run `make lint-py` after adding tests
 - Use `make complete-tests` to fill in blank expectations
-- Tests run via `datatest-stable` harness in `tests/datatest_runner.rs`, use `make test-cases` to run them
+- Regression tests run via `datatest-stable` harness in `crates/monty-datatest/src/main.rs`, use `make test-cases` to run them
 
 ## Python Package (`pydantic-monty`)
 
@@ -491,26 +547,6 @@ Heap-allocated values (`Value::Ref`) use manual reference counting. Key rules:
 Container types (`List`, `Tuple`, `Dict`) also have `clone_with_heap()` methods.
 
 **Resource limits**: When resource limits (allocations, memory, time) are exceeded, execution terminates with a `ResourceError`. No guarantees are made about the state of the heap or reference counts after a resource limit is exceeded. The heap may contain orphaned objects with incorrect refcounts. This is acceptable because resource exhaustion is a terminal error - the execution context should be discarded.
-
-## NOTES
-
-ALWAYS consider code quality when adding new code, if functions are getting too complex or code is duplicated, move relevant logic to a new file.
-Make sure functions are added in the most logical place, e.g. as methods on a struct where appropriate.
-
-The code should follow the "newspaper" style where public and primary functions are at the top of the file, followed by private functions and utilities.
-ALWAYS put utility, private functions and "sub functions" underneath the function they're used in.
-
-It is important to the long term health of the project and maintainability of the codebase that code is well structured and organized, this is very important.
-
-ALWAYS run `make format-rs` and `make lint-rs` after making changes to rust code and fix all suggestions to maintain code quality.
-
-ALWAYS run `make lint-py` after making changes to python code and fix all suggestions to maintain code quality.
-
-ALWAYS update this file when it is out of date.
-
-NEVER add imports anywhere except at the top of the file, this applies to both python and rust.
-
-NEVER write `unsafe` code, if you think you need to write unsafe code, explicitly ask the user or leave a `todo!()` with a suggestion and explanation.
 
 ## JavaScript Package (`monty-js`)
 
@@ -585,3 +621,25 @@ npm test
 - Tests use [ava](https://github.com/avajs/ava) and live in `crates/monty-js/__test__/`
 - Tests are written in TypeScript
 - Follow the existing test style in the `__test__/` directory
+
+## NOTES
+
+ALWAYS consider code quality when adding new code, if functions are getting too complex or code is duplicated, move relevant logic to a new file.
+Make sure functions are added in the most logical place, e.g. as methods on a struct where appropriate.
+
+The code should follow the "newspaper" style where public and primary functions are at the top of the file, followed by private functions and utilities.
+ALWAYS put utility, private functions and "sub functions" underneath the function they're used in.
+
+It is important to the long term health of the project and maintainability of the codebase that code is well structured and organized, this is very important.
+
+ALWAYS run `make format-rs` and `make lint-rs` after making changes to rust code and fix all suggestions to maintain code quality.
+
+ALWAYS run `make lint-py` after making changes to python code and fix all suggestions to maintain code quality.
+
+ALWAYS update this file when it is out of date.
+
+NEVER add imports anywhere except at the top of the file, this applies to both python and rust.
+
+NEVER write `unsafe` code, if you think you need to write unsafe code, explicitly ask the user or leave a `todo!()` with a suggestion and explanation.
+
+When you get asked a question like "Is X really the best approach" ANSWER THE QUESTION! don't try to make a chance based on a perceived instruction in the question!
