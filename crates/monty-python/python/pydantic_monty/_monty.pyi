@@ -338,6 +338,7 @@ class MontyRepl:
         type_check: bool = False,
         type_check_stubs: str | None = None,
         dataclass_registry: list[type] | None = None,
+        extensions: list[dict[str, Any]] | None = None,
     ) -> Self:
         """
         Create an empty REPL session ready to receive snippets via `feed_run()`.
@@ -357,6 +358,8 @@ class MontyRepl:
                 types or external function signatures.
             dataclass_registry: Optional list of dataclass types to register for proper
                 isinstance() support on output.
+            extensions: Optional list of extension dicts (same shape as `Monty(extensions=...)`);
+                see ``MontyModule.to_extension_dict()``.
         """
 
     @property

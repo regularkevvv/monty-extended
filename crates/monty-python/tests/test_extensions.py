@@ -19,17 +19,16 @@ from pydantic_monty import HandleStore, Monty, MontyModule
 # Helpers
 # ---------------------------------------------------------------------------
 
-EXTENSION_DIR = Path(__file__).parents[2] / 'monty' / '..' / '..' / 'examples' / 'native_extension'
 EXTENSION_DIR = (Path(__file__).parent / '..' / '..' / '..' / 'examples' / 'native_extension').resolve()
 
-_LIB_PATH: str | None = None
+_lib_path_cache: str | None = None
 
 
 def _native_lib_path() -> str | None:
     """Returns the path to the built native extension, or None if unavailable."""
-    global _LIB_PATH
-    if _LIB_PATH is not None:
-        return _LIB_PATH
+    global _lib_path_cache
+    if _lib_path_cache is not None:
+        return _lib_path_cache
 
     if platform.system() == 'Darwin':
         lib = EXTENSION_DIR / 'target' / 'release' / 'libmonty_ext_datatools.dylib'
@@ -45,8 +44,8 @@ def _native_lib_path() -> str | None:
             return None
 
     if lib.exists():
-        _LIB_PATH = str(lib)
-        return _LIB_PATH
+        _lib_path_cache = str(lib)
+        return _lib_path_cache
     return None
 
 
@@ -484,7 +483,6 @@ util.double(s)
         assert result == snapshot(120.0)
 
     def test_host_processes_native_output(self):
-        store = HandleStore()
         mod = MontyModule('processor')
 
         @mod.function()
@@ -689,7 +687,7 @@ class TestReplExtensions:
     @requires_native
     def test_repl_native_extension(self):
         repl = pydantic_monty.MontyRepl(extensions=[native_ext_dict()])
-        repl.feed_run("import datatools")
+        repl.feed_run('import datatools')
         repl.feed_run("df = datatools.parse_csv('a,b\\n1,2\\n3,4')")
         result = repl.feed_run('datatools.row_count(df)')
         assert result == snapshot(2)
@@ -700,7 +698,7 @@ class TestAsyncExtensionDispatch:
 
     async def test_async_host_extension(self):
         mod, _ = _make_host_module()
-        code = "import testmod\ntestmod.add(10, 20)"
+        code = 'import testmod\ntestmod.add(10, 20)'
         m = Monty(code, extensions=[mod.to_extension_dict()])
         result = await m.run_async()
         assert result == snapshot(30)

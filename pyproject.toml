@@ -152,6 +152,25 @@ reportIndexIssue = false
 root = "crates/monty-type-checking"
 reportUnnecessaryIsInstance = false
 
+# Extension tests exercise decorator-registered functions (MontyModule.function())
+# that pyright can't see being called — they are looked up by name in Monty code
+# at runtime. Also, inline Monty source strings use `Monty(..., extensions=...)`
+# keyword which pyright's stub check considers unknown before the .pyi stub is
+# regenerated; suppress that here while keeping strict mode for the rest.
+[[tool.pyright.executionEnvironments]]
+root = "crates/monty-python/tests/test_extensions.py"
+reportUnusedFunction = false
+
+# Native extension e2e script was written as a throwaway demo — keep it out of
+# strict mode.
+[[tool.pyright.executionEnvironments]]
+root = "examples/native_extension/test_e2e.py"
+reportConstantRedefinition = false
+reportUnknownParameterType = false
+reportMissingParameterType = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false
+
 [tool.codespell]
 # Ref: https://github.com/codespell-project/codespell#using-a-config-file
 ignore-words-list = 'crate,NotIn,ser,IST'
