@@ -1394,6 +1394,21 @@ impl PyTrait<'_> for Value {
 }
 
 impl Value {
+    /// Returns the Python `Type` for this value using only `&Heap` (no full VM borrow).
+    ///
+    /// Wraps [`py_type_shallow`](Self::py_type_shallow) for immediate values and
+    /// delegates to [`HeapData::py_type`] for `Value::Ref`. Useful in code paths
+    /// that need a type label (e.g. CPython-style "argument N must be X, not Y"
+    /// errors) but don't have a `&VM` handy — notably the macro-generated
+    /// `from_args` bodies, which are passed `heap` + `interns` rather than a VM.
+    #[must_use]
+    pub(crate) fn py_type_heap(&self, heap: &Heap<impl ResourceTracker>) -> Type {
+        match self {
+            Self::Ref(id) => heap.get(*id).py_type(),
+            _ => self.py_type_shallow(),
+        }
+    }
+
     /// Returns the Python `Type` for immediate (non-heap) values without VM access.
     ///
     /// For `Value::Ref` variants this cannot determine the concrete type (that requires
@@ -2034,6 +2049,25 @@ impl Value {
             Self::Ref(heap_id) => matches!(heap.get(*heap_id), HeapData::Str(_)),
             _ => false,
         }
+    }
+
+    /// Extracts an `i32` from a `Value`, accepting `Bool` and `Int`.
+    ///
+    /// Used by `date`, `datetime`, and other constructors that expect
+    /// integer arguments matching CPython's `int` coercion rules.
+    pub fn to_i32(&self) -> RunResult<i32> {
+        let int_value = match self {
+            Self::Bool(b) => i64::from(*b),
+            Self::Int(i) => *i,
+            _ => {
+                return Err(
+                    SimpleException::new_msg(ExcType::TypeError, "an integer is required (got type float)").into(),
+                );
+            }
+        };
+        i32::try_from(int_value).map_err(|_| {
+            SimpleException::new_msg(ExcType::OverflowError, "signed integer is greater than maximum").into()
+        })
     }
 }
 
