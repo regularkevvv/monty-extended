@@ -165,17 +165,24 @@ its `ResumeCall` arrives, so only one external call is outstanding at a time.
   `max_duration_micros` on events are always zero.
 - **Type checking** (`Configure.type_check`, `Feed.skip_type_check`) is
   ignored — snippets are always executed, never type-checked.
-- **`Configure.script_name`** is the filename snippets compile under, so CPython
-  tracebacks (and `SyntaxError`s) report it. It is also how user frames are told
-  apart from the internal `runner.py` driver frames when rebuilding the traceback.
+- **`Configure.script_name`** is the filename reported for every sandbox frame
+  in a traceback. Internally each feed compiles under a unique `<input-N>` name
+  (with its source registered in `linecache`, so previews resolve even for a
+  frame from a function defined in an earlier feed); `script_name` is substituted
+  in when the traceback is rebuilt.
 - **Error tracebacks** are reconstructed from the CPython traceback and sent in
-  `RaisedException.traceback`, but only at reduced fidelity: one frame per *user*
-  frame (the `runner.py` driver frames — `run`/`drive_async`/`eval` — are filtered
-  out), each carrying the `script_name` filename, the line number, and the
-  function name (`<module>` for top-level code). Column ranges, source-line
-  previews, and caret markers are **not** reconstructed, so a frame's rendered
-  traceback line has no `~~~` underline. This is unlike both native Monty (which
-  attaches previews and carets) and CPython's own rich traceback output.
+  `RaisedException.traceback`: one frame per *user* frame (the `runner.py` driver
+  frames — `run`/`drive_async`/`eval` — are filtered out), each with the
+  `script_name` filename, line number, function name (`<module>` for top-level
+  code), source-line preview, and caret span. The caret column span comes from
+  CPython's reported offsets, rendered in Monty's uniform `~~~` style rather than
+  CPython's two-tone `~~~^^^`. Caret *visibility*, however, is a rough heuristic,
+  not CPython's exact anchor-aware decision: a caret line is drawn for every frame
+  except `raise` statements. So CPython's other no-caret cases — attribute access,
+  a bare-name lookup on its own line, and full-line `x = f()` / `return f()` calls
+  — get a whole-line underline here where CPython draws none. `SyntaxError`s raise
+  during compilation, so their frames are runner-internal and filtered out — only
+  the type and message survive.
 - **Mounts** (`Feed.mounts`) are ignored; the child performs no virtual
   filesystem mapping. Real filesystem access goes straight to the host FS
   (see the security note above).
