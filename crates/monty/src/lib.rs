@@ -7,6 +7,7 @@ mod args;
 mod asyncio;
 mod builtins;
 mod bytecode;
+mod codecs;
 mod exception_private;
 mod exception_public;
 mod expressions;
@@ -37,7 +38,7 @@ mod value;
 pub use crate::run::RefCountOutput;
 pub use crate::{
     exception_private::ExcType,
-    exception_public::{CodeLoc, MontyException, StackFrame},
+    exception_public::{CodeLoc, ExcData, MontyException, StackFrame, UnicodeErrorData, UnicodeErrorObject},
     io::{PrintStream, PrintWriter, PrintWriterCallback},
     object::{
         DictPairs, InvalidInputError, MontyDate, MontyDateTime, MontyFileHandle, MontyObject, MontyTimeDelta,

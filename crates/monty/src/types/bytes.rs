@@ -7,7 +7,7 @@
 /// # Implemented Methods
 ///
 /// ## Encoding/Decoding
-/// - `decode([encoding[, errors]])` - Decode to string (UTF-8 only)
+/// - `decode([encoding[, errors]])` - Decode to string (UTF-8, ASCII, UTF-16/32)
 /// - `hex([sep[, bytes_per_sep]])` - Return hex string representation
 /// - `fromhex(string)` - Create bytes from hex string (classmethod)
 ///
@@ -80,6 +80,7 @@ use super::{MontyIter, PyTrait, Type};
 use crate::{
     args::{ArgValues, FromArgs, StrArg},
     bytecode::{CallResult, VM},
+    codecs::Codec,
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunResult, SimpleException},
     hash::{HashValue, hash_python_bytes},
@@ -501,34 +502,26 @@ pub fn bytes_repr(bytes: &[u8]) -> String {
 
 /// Implements Python's `bytes.decode([encoding[, errors]])` method.
 ///
-/// Converts bytes to a string. Currently only supports UTF-8 encoding.
+/// Converts bytes to a string. Encoding-name resolution and the codec
+/// implementations (UTF-8, ASCII, UTF-16/32 families) live in
+/// [`crate::codecs`]. Like CPython, the error handler name is only looked up
+/// (and validated) when a byte actually needs handling — see
+/// `limitations/encoding.md` for the handful of decode divergences (the
+/// surrogate-producing handlers raise `NotImplementedError`).
 fn bytes_decode<'h>(
     bytes: &HeapRead<'h, [u8]>,
     args: ArgValues,
     vm: &mut VM<'h, impl ResourceTracker>,
 ) -> RunResult<Value> {
     let BytesDecodeArgs { encoding, errors } = BytesDecodeArgs::from_args(args, vm)?;
-    // `errors` is accepted for parity but ignored — UTF-8 decoding of valid
-    // bytes has nothing to handle, and `lookup_error_unknown_error_handler`
-    // would be the next layer once non-UTF-8 codecs land. The guard still
-    // drops its heap reference.
     defer_drop!(errors, vm);
     defer_drop!(encoding, vm);
     let encoding = encoding.as_ref().map_or("utf-8", |e| e.as_str(vm));
+    let errors = errors.as_ref().map_or("strict", |e| e.as_str(vm));
 
-    // Only support UTF-8 family
-    if !(encoding.eq_ignore_ascii_case("utf-8")
-        || encoding.eq_ignore_ascii_case("utf8")
-        || encoding.eq_ignore_ascii_case("utf_8"))
-    {
-        return Err(ExcType::lookup_error_unknown_encoding(encoding));
-    }
-
-    // Decode as UTF-8
-    match str::from_utf8(bytes.get(vm.heap)) {
-        Ok(s) => Ok(super::str::allocate_string(s, vm.heap)?),
-        Err(_) => Err(ExcType::unicode_decode_error_invalid_utf8()),
-    }
+    let codec = Codec::find(encoding).ok_or_else(|| ExcType::lookup_error_unknown_encoding(encoding))?;
+    let s = codec.decode(bytes.get(vm.heap), errors)?;
+    Ok(super::str::allocate_string(s, vm.heap)?)
 }
 
 /// Argument shape for `bytes.decode(encoding='utf-8', errors='strict')`.

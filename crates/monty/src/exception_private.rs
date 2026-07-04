@@ -11,8 +11,8 @@ use crate::{
     args::ArgValues,
     bytecode::{CallResult, VM},
     defer_drop,
-    exception_public::{MontyException, SourceMap, StackFrame},
-    fstring::FormatError,
+    exception_public::{ExcData, MontyException, SourceMap, StackFrame, UnicodeErrorData},
+    fstring::{FormatError, ascii_escape},
     heap::{HeapData, HeapRead},
     intern::{Interns, StaticStrings, StringId},
     parse::CodeRange,
@@ -86,6 +86,9 @@ pub enum ExcType {
     ValueError,
     /// Subclass of ValueError - for encoding/decoding errors.
     UnicodeDecodeError,
+    /// Subclass of ValueError - for encoding errors (e.g. `str.encode('ascii')`
+    /// on a string containing non-ASCII characters).
+    UnicodeEncodeError,
     /// Subclass of ValueError for invalid JSON syntax in `json.loads()`.
     #[strum(serialize = "json.JSONDecodeError")]
     JsonDecodeError,
@@ -175,11 +178,14 @@ impl ExcType {
             Self::AttributeError => matches!(self, Self::FrozenInstanceError),
             // NameError catches UnboundLocalError
             Self::NameError => matches!(self, Self::UnboundLocalError),
-            // ValueError catches UnicodeDecodeError, json.JSONDecodeError, and
-            // io.UnsupportedOperation (which in CPython has dual OSError + ValueError parentage)
+            // ValueError catches UnicodeDecodeError, UnicodeEncodeError, json.JSONDecodeError,
+            // and io.UnsupportedOperation (which in CPython has dual OSError + ValueError parentage)
             Self::ValueError => matches!(
                 self,
-                Self::UnicodeDecodeError | Self::JsonDecodeError | Self::UnsupportedOperation
+                Self::UnicodeDecodeError
+                    | Self::UnicodeEncodeError
+                    | Self::JsonDecodeError
+                    | Self::UnsupportedOperation
             ),
             // ImportError catches ModuleNotFoundError
             Self::ImportError => matches!(self, Self::ModuleNotFoundError),
@@ -1476,15 +1482,63 @@ impl ExcType {
         SimpleException::new_msg(Self::LookupError, format!("unknown encoding: {encoding}")).into()
     }
 
-    /// Creates a UnicodeDecodeError for invalid UTF-8 bytes in decode().
+    /// Creates a UnicodeEncodeError for a run of `start..end` consecutive
+    /// characters (character indices, not byte offsets) of `object` — the
+    /// full string being encoded — that can't be represented in the target
+    /// `codec`. `first_char` is the character at `start`, used for the
+    /// single-character message form.
     ///
-    /// Matches CPython's format: `UnicodeDecodeError: 'utf-8' codec can't decode bytes...`
+    /// Matches CPython's format, which differs for a single character vs. a run:
+    /// `UnicodeEncodeError: 'ascii' codec can't encode character '\xe9' in
+    /// position 1: ordinal not in range(128)` or `... can't encode characters
+    /// in position 1-2: ordinal not in range(128)`.
     #[must_use]
-    pub(crate) fn unicode_decode_error_invalid_utf8() -> RunError {
+    pub(crate) fn unicode_encode_error(
+        codec: &str,
+        object: &str,
+        first_char: char,
+        start: usize,
+        end: usize,
+        reason: &str,
+    ) -> RunError {
+        // Callers must pass a non-empty range; checked in debug builds only so
+        // a wrong caller can't panic the VM in release (it gets a garbled
+        // message position instead, which is harmless).
+        debug_assert!(
+            end > start,
+            "unicode_encode_error: end ({end}) must be > start ({start})"
+        );
+        let msg = if end - start == 1 {
+            format!(
+                "'{codec}' codec can't encode character '{}' in position {start}: {reason}",
+                ascii_escape(&first_char.to_string())
+            )
+        } else {
+            let last = end - 1;
+            format!("'{codec}' codec can't encode characters in position {start}-{last}: {reason}")
+        };
+        SimpleException::new_msg(Self::UnicodeEncodeError, msg)
+            .with_data(UnicodeErrorData::encode(codec, object, start, end, reason))
+            .into()
+    }
+
+    /// Creates a UnicodeDecodeError for the undecodable byte range `start..end`
+    /// (byte offsets into `object` — the full input being decoded).
+    ///
+    /// Matches CPython's format, which differs for a single byte vs. a run:
+    /// `UnicodeDecodeError: 'ascii' codec can't decode byte 0xe9 in position 6:
+    /// ordinal not in range(128)` or `'utf-8' codec can't decode bytes in
+    /// position 0-1: unexpected end of data`.
+    #[must_use]
+    pub(crate) fn unicode_decode_error(codec: &str, object: &[u8], start: usize, end: usize, reason: &str) -> RunError {
+        // Defensive `get`: `start` always indexes a real byte for the errors
+        // Monty produces, but a wrong caller must not be able to panic the VM.
+        let first_byte = object.get(start).copied().unwrap_or(0);
         SimpleException::new_msg(
             Self::UnicodeDecodeError,
-            "'utf-8' codec can't decode bytes: invalid utf-8 sequence",
+            unicode_decode_error_msg(codec, first_byte, start, end, reason),
         )
+        .with_data(UnicodeErrorData::decode(codec, object, start, end, reason))
         .into()
     }
 
@@ -1502,6 +1556,40 @@ impl ExcType {
     #[must_use]
     pub(crate) fn lookup_error_unknown_error_handler(name: &str) -> RunError {
         SimpleException::new_msg(Self::LookupError, format!("unknown error handler name '{name}'")).into()
+    }
+
+    /// Creates a TypeError for an encode-only error handler (`xmlcharrefreplace`,
+    /// `namereplace`) invoked for a decode error.
+    ///
+    /// Matches CPython's format: `TypeError: don't know how to handle
+    /// UnicodeDecodeError in error callback`
+    #[must_use]
+    pub(crate) fn type_error_decode_error_callback() -> RunError {
+        SimpleException::new_msg(
+            Self::TypeError,
+            "don't know how to handle UnicodeDecodeError in error callback",
+        )
+        .into()
+    }
+
+    /// Creates a NotImplementedError for a decode error handler that would
+    /// produce lone surrogates (`surrogateescape` always; `surrogatepass` when
+    /// the input actually contains an encoded surrogate).
+    ///
+    /// CPython's handlers put lone surrogates (e.g. U+DC80–U+DCFF for
+    /// `surrogateescape`) in the resulting string. Monty strings are strict
+    /// UTF-8 and cannot represent lone surrogates, so these cases cannot be
+    /// supported — see `limitations/encoding.md`.
+    #[must_use]
+    pub(crate) fn not_implemented_surrogate_handler_decode(handler: &str) -> RunError {
+        SimpleException::new_msg(
+            Self::NotImplementedError,
+            format!(
+                "the '{handler}' error handler is not supported by Monty for decoding: \
+                 Monty strings cannot contain the lone surrogate characters it produces"
+            ),
+        )
+        .into()
     }
 
     /// Creates a `re.PatternError` for an invalid regex pattern or unsupported regex feature.
@@ -1586,6 +1674,30 @@ impl ExcType {
     }
 }
 
+/// Formats the message for a `UnicodeDecodeError` covering the byte range
+/// `start..end`: CPython's single-byte form (`byte 0x{first_byte:02x} in
+/// position {start}`) when the range is one byte, otherwise the range form
+/// (`bytes in position {start}-{end - 1}`).
+///
+/// A free function (rather than folded into [`ExcType::unicode_decode_error`])
+/// so the fs layer can produce the identical wording when converting a
+/// `MountError::InvalidUtf8` from a text-mode file read into an exception.
+pub(crate) fn unicode_decode_error_msg(codec: &str, first_byte: u8, start: usize, end: usize, reason: &str) -> String {
+    // Callers must pass a non-empty range; checked in debug builds only so a
+    // wrong caller can't panic the VM in release (it gets a garbled message
+    // position instead, which is harmless).
+    debug_assert!(
+        end > start,
+        "unicode_decode_error_msg: end ({end}) must be > start ({start})"
+    );
+    if end - start == 1 {
+        format!("'{codec}' codec can't decode byte 0x{first_byte:02x} in position {start}: {reason}")
+    } else {
+        let last = end - 1;
+        format!("'{codec}' codec can't decode bytes in position {start}-{last}: {reason}")
+    }
+}
+
 /// Simple lightweight representation of an exception.
 ///
 /// This is used for performance reasons for common exception patterns.
@@ -1594,6 +1706,13 @@ impl ExcType {
 pub(crate) struct SimpleException {
     exc_type: ExcType,
     arg: Option<String>,
+    /// Structured payload (e.g. unicode-error constructor fields), carried
+    /// through catch/re-raise so it reaches the public `MontyException` when
+    /// the exception escapes the sandbox. No `skip_serializing_if`:
+    /// exceptions round-trip through non-self-describing snapshot formats
+    /// where skipped fields break deserialization.
+    #[serde(default)]
+    data: ExcData,
 }
 
 impl fmt::Display for SimpleException {
@@ -1602,9 +1721,10 @@ impl fmt::Display for SimpleException {
     }
 }
 impl From<MontyException> for SimpleException {
-    fn from(exc: MontyException) -> Self {
+    fn from(mut exc: MontyException) -> Self {
         Self {
             exc_type: exc.exc_type(),
+            data: exc.take_data(),
             arg: exc.into_message(),
         }
     }
@@ -1614,7 +1734,11 @@ impl SimpleException {
     /// Creates a new exception with the given type and optional argument message.
     #[must_use]
     pub fn new(exc_type: ExcType, arg: Option<String>) -> Self {
-        Self { exc_type, arg }
+        Self {
+            exc_type,
+            arg,
+            data: ExcData::None,
+        }
     }
 
     /// Creates a new exception with the given type and argument message.
@@ -1623,13 +1747,31 @@ impl SimpleException {
         Self {
             exc_type,
             arg: Some(arg.to_string()),
+            data: ExcData::None,
         }
     }
 
     /// Creates a new exception with the given type and no argument message.
     #[must_use]
     pub fn new_none(exc_type: ExcType) -> Self {
-        Self { exc_type, arg: None }
+        Self {
+            exc_type,
+            arg: None,
+            data: ExcData::None,
+        }
+    }
+
+    /// Attaches a structured payload — see [`ExcData`].
+    #[must_use]
+    pub fn with_data(mut self, data: ExcData) -> Self {
+        self.data = data;
+        self
+    }
+
+    /// The structured payload, [`ExcData::None`] for most exceptions.
+    #[must_use]
+    pub fn data(&self) -> &ExcData {
+        &self.data
     }
 
     #[must_use]
@@ -1841,7 +1983,7 @@ impl ExceptionRaise {
             })
             .unwrap_or_default();
 
-        MontyException::new_full(self.exc.exc_type(), self.exc.arg().cloned(), traceback)
+        MontyException::new_full(self.exc.exc_type, self.exc.arg, traceback).with_data(self.exc.data)
     }
 }
 

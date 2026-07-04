@@ -12,6 +12,7 @@ use super::{Bytes, MontyIter, PyTrait};
 use crate::{
     args::{ArgValues, FromArgs, StrArg},
     bytecode::{CallResult, VM},
+    codecs::Codec,
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunResult},
     hash::{HashValue, hash_python_str},
@@ -1944,8 +1945,12 @@ struct ExpandtabsArgs {
 
 /// Implements Python's `str.encode(encoding='utf-8', errors='strict')` method.
 ///
-/// Returns an encoded version of the string as a bytes object. Only supports
-/// UTF-8 encoding (the native encoding for Rust strings).
+/// Returns an encoded version of the string as a bytes object. Encoding-name
+/// resolution and the codec implementations (UTF-8, ASCII, UTF-16/32
+/// families) live in [`crate::codecs`]. Like CPython, the error handler name
+/// is only looked up (and validated) when an actual encoding error occurs —
+/// `'hello'.encode('ascii', 'bogus')` succeeds because there's nothing for
+/// the handler to do.
 fn str_encode<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Value> {
     let EncodeArgs { encoding, errors } = EncodeArgs::from_args(args, vm)?;
     defer_drop!(encoding, vm);
@@ -1953,18 +1958,8 @@ fn str_encode<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h, impl R
     let encoding = encoding.as_ref().map_or("utf-8", |e| e.as_str(vm));
     let errors = errors.as_ref().map_or("strict", |e| e.as_str(vm));
 
-    // Only UTF-8 is supported - Rust strings are always valid UTF-8
-    if !(encoding.eq_ignore_ascii_case("utf-8") || encoding.eq_ignore_ascii_case("utf8")) {
-        return Err(ExcType::lookup_error_unknown_encoding(encoding));
-    }
-
-    // For UTF-8 encoding of a valid UTF-8 string, errors mode doesn't matter
-    // since there's nothing to handle - the string is already valid UTF-8
-    if errors != "strict" && errors != "ignore" && errors != "replace" && errors != "backslashreplace" {
-        return Err(ExcType::lookup_error_unknown_error_handler(errors));
-    }
-
-    let bytes = s.get(vm.heap).as_bytes().to_vec();
+    let codec = Codec::find(encoding).ok_or_else(|| ExcType::lookup_error_unknown_encoding(encoding))?;
+    let bytes = codec.encode(s.get(vm.heap), errors, vm.heap.tracker())?;
     let heap_id = vm.heap.allocate(HeapData::Bytes(Bytes::new(bytes)))?;
     Ok(Value::Ref(heap_id))
 }

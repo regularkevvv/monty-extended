@@ -10,8 +10,8 @@ code **cannot define new exception classes** (no `class` statement; see
 `ArithmeticError`, `OverflowError`, `ZeroDivisionError`, `LookupError`,
 `IndexError`, `KeyError`, `RuntimeError`, `NotImplementedError`,
 `RecursionError`, `AttributeError`, `FrozenInstanceError`, `NameError`,
-`UnboundLocalError`, `ValueError`, `UnicodeDecodeError`, `ImportError`,
-`ModuleNotFoundError`, `OSError`, `FileNotFoundError`, `FileExistsError`,
+`UnboundLocalError`, `ValueError`, `UnicodeDecodeError`, `UnicodeEncodeError`,
+`ImportError`, `ModuleNotFoundError`, `OSError`, `FileNotFoundError`, `FileExistsError`,
 `IsADirectoryError`, `NotADirectoryError`, `PermissionError`,
 `AssertionError`, `MemoryError`, `StopIteration`, `SyntaxError`,
 `TimeoutError`, `TypeError`.
@@ -29,7 +29,7 @@ both `OSError` and `ValueError`, matching CPython's dual parentage).
 `BrokenPipeError`), `BlockingIOError`, `ChildProcessError`,
 `InterruptedError`, `ProcessLookupError`, `ReferenceError`,
 `StopAsyncIteration`, `SystemError`, `TabError`, `IndentationError`,
-`UnicodeError` (parent), `UnicodeEncodeError`, `UnicodeTranslateError`,
+`UnicodeError` (parent), `UnicodeTranslateError`,
 `EncodingWarning`, `EnvironmentError` / `IOError` aliases,
 `ExceptionGroup` / `BaseExceptionGroup` (see [language.md](language.md)).
 
@@ -45,7 +45,11 @@ not supported — passing more than one argument raises an internal error.
 - `exc.args` — a tuple with 0 or 1 elements. Always a `tuple`, even when
   empty.
 - `str(exc)` — returns the single message string, or `""` if none.
-- `repr(exc)` — `ClassName('message')` matching CPython.
+- `repr(exc)` — `ClassName('message')` matching CPython, **except**
+  `UnicodeDecodeError`/`UnicodeEncodeError`: CPython reprs these from their
+  real 5-field constructor (`UnicodeDecodeError('ascii', b'\xff', 0, 1,
+  'ordinal not in range(128)')`), which Monty doesn't track — Monty's
+  `repr()` uses the generic single-message form instead.
 
 **Not implemented:** `__cause__`, `__context__`, `__suppress_context__`,
 `__traceback__`, `__notes__`, `add_note()`. The `raise X from Y` syntax
