@@ -63,7 +63,7 @@
     "lint": "oxlint .",
     "test": "vitest run",
     "test:browser": "vitest --config vitest.browser.config.ts run",
-    "smoke-test": "bash scripts/smoke-test.sh",
+    "assemble-packages": "node scripts/assemble-packages.mjs",
     "create-platform-packages": "node scripts/create-platform-packages.mjs"
   },
   "devDependencies": {

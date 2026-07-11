@@ -46,10 +46,6 @@ test-js: build-js ## Test the JS package (builds the monty binary the workers ru
 	cargo build -p monty-runtime
 	cd crates/monty-js && MONTY_BIN="$${CARGO_TARGET_DIR:-../../target}/debug/monty$(EXE_EXT)" npm test
 
-.PHONY: smoke-test-js
-smoke-test-js: ## Run smoke test for JS package (builds, packs, and tests installation)
-	cd crates/monty-js && npm run smoke-test
-
 .PHONY: dev-py-release
 dev-py-release: ## Install the python package for development with a release build
 	uv run maturin develop --uv -m crates/monty-runtime/Cargo.toml --release

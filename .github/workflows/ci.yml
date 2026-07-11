@@ -891,16 +891,10 @@ jobs:
         run: npm test
         working-directory: crates/monty-js
 
-      - name: Smoke test packaging
-        if: ${{ matrix.os != 'windows-latest' }}
-        run: npm run smoke-test
-        working-directory: crates/monty-js
-
-  # Release builds of the monty binary AND the napi shared library for the
-  # npm platform packages (@pydantic/monty-<platform>): each package ships
-  # the `.node` binding next to the `monty` worker binary.
+  # Release builds of the napi shared library for each npm platform package.
+  # The worker executables are reused from the pydantic-monty-runtime wheels.
   build-js-binaries:
-    name: build JS binary - ${{ matrix.settings.triple }}
+    name: build JS addon - ${{ matrix.settings.triple }}
     runs-on: ${{ matrix.settings.host }}
     # only run on push to main, on tags, or if 'Full Build' label is present
     if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main' || contains(github.event.pull_request.labels.*.name, 'Full Build') || (github.event_name == 'workflow_dispatch' && inputs.run_release)
@@ -951,9 +945,6 @@ jobs:
         run: npm install
         working-directory: crates/monty-js
 
-      - name: Build the monty binary
-        run: cargo build --release -p monty-runtime --target ${{ matrix.settings.target }}
-
       - name: Build the napi shared library
         run: npx napi build --platform --release --esm --target ${{ matrix.settings.target }}
         working-directory: crates/monty-js
@@ -961,11 +952,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: monty-bin-${{ matrix.settings.triple }}
-          path: |
-            target/${{ matrix.settings.target }}/release/monty
-            target/${{ matrix.settings.target }}/release/monty.exe
-            crates/monty-js/monty.${{ matrix.settings.triple }}.node
+          name: monty-addon-${{ matrix.settings.triple }}
+          path: crates/monty-js/monty.${{ matrix.settings.triple }}.node
           if-no-files-found: error
 
   build-wasm:
@@ -1045,19 +1033,88 @@ jobs:
         run: npx playwright install --with-deps chromium && npm run test:browser
         working-directory: crates/monty-js
 
-  release-js:
-    name: Release to NPM
-    runs-on: ubuntu-latest
+  assemble-js-packages:
+    name: assemble JS packages
     needs:
-      - check
-      - test-js
+      - build
+      - build-pgo
       - build-js-binaries
-      - test-browser
-      - release-python
-    if: success() && (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.run_release))
-    permissions:
-      contents: write
-      id-token: write
+      - build-wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+        with:
+          toolchain: stable
+
+      - name: Setup node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm install
+        working-directory: crates/monty-js
+
+      # Generates the native loader and all TypeScript entry points. The host
+      # addon is discarded; platform addons come from build-js-binaries.
+      - name: Build main package
+        run: npm run build
+        working-directory: crates/monty-js
+
+      - name: Download native addon artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: monty-addon-*
+          path: crates/monty-js/artifacts
+
+      - name: Download runtime wheel artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: pypi_files-*-cli
+          path: crates/monty-js/artifacts
+
+      - name: Download wasm artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: wasm-bindings
+          path: crates/monty-js/dist/worker
+
+      - name: Assemble, validate, and pack
+        run: npm run assemble-packages
+        working-directory: crates/monty-js
+
+      - name: Upload package tarballs
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: js-package-tarballs
+          path: crates/monty-js/package-tarballs/*.tgz
+          if-no-files-found: error
+
+  test-js-packages:
+    name: test ${{ matrix.platform.triple }} JS package on node@${{ matrix.node }}
+    needs:
+      - assemble-js-packages
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '24']
+        platform:
+          - os: macos-15-intel
+            triple: darwin-x64
+          - os: macos-latest
+            triple: darwin-arm64
+          - os: ubuntu-latest
+            triple: linux-x64-gnu
+          - os: ubuntu-24.04-arm
+            triple: linux-arm64-gnu
+          - os: windows-latest
+            triple: win32-x64-msvc
+    runs-on: ${{ matrix.platform.os }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -1066,74 +1123,61 @@ jobs:
       - name: Setup node
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+
+      - name: Download package tarballs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: js-package-tarballs
+          path: crates/monty-js/package-tarballs
+
+      - name: Install packed packages
+        run: npm install ../package-tarballs/monty-main.tgz ../package-tarballs/monty-${{ matrix.platform.triple }}.tgz --force --no-save --no-package-lock
+        working-directory: crates/monty-js/smoke-test
+
+      - name: Import package and run a worker
+        run: node package-smoke.mjs
+        working-directory: crates/monty-js/smoke-test
+
+  release-js:
+    name: Release to NPM
+    runs-on: ubuntu-latest
+    needs:
+      - check
+      - test-js
+      - test-js-packages
+      - test-browser
+      - release-python
+    if: success() && (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.run_release))
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Setup node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
           node-version: 24
           package-manager-cache: false
           registry-url: 'https://registry.npmjs.org'
 
-      # no release versioning, see https://github.com/dtolnay/rust-toolchain/issues/180
-      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
-        with:
-          toolchain: stable
-
-      - name: Install dependencies
-        run: npm install
-        working-directory: crates/monty-js
-
-      # generates the native addon loader and dist/; the host .node
-      # it also builds is not shipped (platform packages carry the .nodes)
-      - name: Build
-        run: npm run build
-        working-directory: crates/monty-js
-
-      - name: Create platform package dirs
-        run: |
-          npx napi create-npm-dirs
-          npm run create-platform-packages
-        working-directory: crates/monty-js
-
-      - name: Download binaries into platform packages
+      - name: Download tested package tarballs
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: monty-bin-*
-          path: crates/monty-js/artifacts
+          name: js-package-tarballs
+          path: package-tarballs
 
-      - name: Download wasm artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: wasm-bindings
-          path: crates/monty-js/dist/worker
-
-      # download-artifact nests binary artifacts and drops the executable bit;
-      # arrange each triple's binary + .node into npm/<triple>/. The wasm
-      # worker module was downloaded directly next to its dist loaders.
-      - name: Arrange binaries
-        run: |
-          for dir in artifacts/monty-bin-*; do
-            triple=${dir#artifacts/monty-bin-}
-            # -type f: without it the artifact dir itself matches 'monty*' and
-            # gets moved wholesale, killing the find that is mid-traversal
-            find "$dir" -type f -name 'monty*' -exec mv {} "npm/$triple/" \;
-          done
-          chmod +x npm/*/monty npm/*/monty.exe 2>/dev/null || true
-          ls -lR npm/ dist/worker/
-        working-directory: crates/monty-js
-
-      - id: check-version
-        uses: samuelcolvin/check-python-version@ee87cddb8049d2694cc03badc8569765a05cef00 # v5
-        with:
-          version_file_path: 'Cargo.toml'
-
-      - name: Publish
+      - name: Publish tested tarballs
+        shell: bash
         run: |
           if [[ "$GITHUB_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Publishing stable release"
-            TAG_ARG=""
+            TAG_ARG=()
           else
             echo "Publishing pre-release with 'next' tag"
-            TAG_ARG="--tag next"
+            TAG_ARG=(--tag next)
           fi
-          for pkg_dir in npm/*/; do
-            (cd "$pkg_dir" && npm publish --provenance --access public $TAG_ARG)
+          for tarball in package-tarballs/monty-{darwin,linux,win32}-*.tgz; do
+            npm publish "$tarball" --provenance --access public "${TAG_ARG[@]}"
           done
-          npm publish --provenance --access public $TAG_ARG
-        working-directory: crates/monty-js
+          npm publish package-tarballs/monty-main.tgz --provenance --access public "${TAG_ARG[@]}"
