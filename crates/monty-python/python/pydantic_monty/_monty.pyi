@@ -323,6 +323,7 @@ class Monty:
         limits: ResourceLimits | None = None,
         type_check: bool = False,
         type_check_stubs: str | None = None,
+        assert_message_annotations: bool | int = ...,
         dataclass_registry: list[type] | None = None,
     ) -> MontySession:
         """
@@ -338,6 +339,12 @@ class Monty:
                 successfully executed snippet is appended to the accumulated
                 context used for type-checking subsequent snippets.
             type_check_stubs: Stub declarations made available to type checking.
+            assert_message_annotations: Give failed `assert` statements
+                pytest-style introspected messages, e.g.
+                `AssertionError: assert 2 == 5` — a deliberate divergence from
+                CPython's empty `AssertionError`. On by default; set to `False`
+                to restore CPython's behavior, or to an int >= 1 to customize
+                the per-operand repr truncation length (default 120 bytes).
             dataclass_registry: Dataclass types to register for proper
                 isinstance() support on output.
         """
@@ -582,6 +589,7 @@ class AsyncMonty:
         limits: ResourceLimits | None = None,
         type_check: bool = False,
         type_check_stubs: str | None = None,
+        assert_message_annotations: bool | int = ...,
         dataclass_registry: list[type] | None = None,
     ) -> AsyncMontySession:
         """
@@ -654,6 +662,7 @@ class AsyncMontyWebsocket:
         limits: ResourceLimits | None = None,
         type_check: bool = False,
         type_check_stubs: str | None = None,
+        assert_message_annotations: bool | int = ...,
         dataclass_registry: list[type] | None = None,
     ) -> AsyncMontySession:
         """

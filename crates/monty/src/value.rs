@@ -584,21 +584,21 @@ impl<'h> PyTrait<'h> for Value {
                 if *v2 == 0.0 {
                     Err(ExcType::zero_division().into())
                 } else {
-                    Ok(Some(Self::Float(v1 % v2)))
+                    Ok(Some(Self::Float(py_float_mod(*v1, *v2))))
                 }
             }
             (Self::Float(v1), Self::Int(v2)) => {
                 if *v2 == 0 {
                     Err(ExcType::zero_division().into())
                 } else {
-                    Ok(Some(Self::Float(v1 % (*v2 as f64))))
+                    Ok(Some(Self::Float(py_float_mod(*v1, *v2 as f64))))
                 }
             }
             (Self::Int(v1), Self::Float(v2)) => {
                 if *v2 == 0.0 {
                     Err(ExcType::zero_division().into())
                 } else {
-                    Ok(Some(Self::Float((*v1 as f64) % v2)))
+                    Ok(Some(Self::Float(py_float_mod(*v1 as f64, *v2))))
                 }
             }
             _ => Ok(None),
@@ -2532,6 +2532,23 @@ pub(crate) fn floor_divmod(a: i64, b: i64) -> Option<(i64, i64)> {
     }
 }
 
+/// Computes Python-style float modulo (CPython's `float_rem`).
+///
+/// Unlike Rust's `%` (which follows the dividend's sign), the result takes the
+/// divisor's sign — `-7.0 % 3.0 == 2.0` — and a zero result gets the divisor's
+/// sign too (`6.0 % -3.0 == -0.0`). Callers must reject a zero divisor first
+/// (`ZeroDivisionError`); this helper assumes `b != 0`.
+fn py_float_mod(a: f64, b: f64) -> f64 {
+    let r = a % b;
+    if r == 0.0 {
+        0.0f64.copysign(b)
+    } else if (b < 0.0) != (r < 0.0) {
+        r + b
+    } else {
+        r
+    }
+}
+
 /// Converts a heap `HeapId` into its tagged `id()` value, ensuring it never collides with other spaces.
 #[inline]
 pub fn heap_tagged_id(heap_id: HeapId) -> usize {
@@ -2776,7 +2793,9 @@ mod tests {
     use num_bigint::BigInt;
 
     use super::*;
-    use crate::{PrintWriter, heap::HeapReader, intern::InternerBuilder, resource::NoLimitTracker};
+    use crate::{
+        PrintWriter, heap::HeapReader, intern::InternerBuilder, resource::NoLimitTracker, run::AssertMessageAnnotations,
+    };
 
     /// Creates a heap and directly allocates a LongInt with the given BigInt value.
     ///
@@ -2807,7 +2826,13 @@ mod tests {
 
         let mut interns = create_test_interns();
         let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
-            let vm = VM::new(Vec::new(), reader, interns, PrintWriter::Disabled);
+            let vm = VM::new(
+                Vec::new(),
+                reader,
+                interns,
+                PrintWriter::Disabled,
+                AssertMessageAnnotations::DEFAULT_MAX_BYTES.get(),
+            );
             value.as_index(&vm, Type::List)
         });
         assert_eq!(result.unwrap(), 42);
@@ -2822,7 +2847,13 @@ mod tests {
 
         let mut interns = create_test_interns();
         let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
-            let vm = VM::new(Vec::new(), reader, interns, PrintWriter::Disabled);
+            let vm = VM::new(
+                Vec::new(),
+                reader,
+                interns,
+                PrintWriter::Disabled,
+                AssertMessageAnnotations::DEFAULT_MAX_BYTES.get(),
+            );
             value.as_index(&vm, Type::List)
         });
         assert_eq!(result.unwrap(), -100);
@@ -2839,7 +2870,13 @@ mod tests {
 
         let mut interns = create_test_interns();
         let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
-            let vm = VM::new(Vec::new(), reader, interns, PrintWriter::Disabled);
+            let vm = VM::new(
+                Vec::new(),
+                reader,
+                interns,
+                PrintWriter::Disabled,
+                AssertMessageAnnotations::DEFAULT_MAX_BYTES.get(),
+            );
             value.as_index(&vm, Type::List)
         });
         assert!(result.is_err());
@@ -2856,7 +2893,13 @@ mod tests {
 
         let mut interns = create_test_interns();
         let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
-            let vm = VM::new(Vec::new(), reader, interns, PrintWriter::Disabled);
+            let vm = VM::new(
+                Vec::new(),
+                reader,
+                interns,
+                PrintWriter::Disabled,
+                AssertMessageAnnotations::DEFAULT_MAX_BYTES.get(),
+            );
             value.as_int(&vm)
         });
         assert_eq!(result.unwrap(), 12345);
@@ -2872,7 +2915,13 @@ mod tests {
 
         let mut interns = create_test_interns();
         let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
-            let vm = VM::new(Vec::new(), reader, interns, PrintWriter::Disabled);
+            let vm = VM::new(
+                Vec::new(),
+                reader,
+                interns,
+                PrintWriter::Disabled,
+                AssertMessageAnnotations::DEFAULT_MAX_BYTES.get(),
+            );
             value.as_int(&vm)
         });
         assert!(result.is_err());
@@ -2887,7 +2936,13 @@ mod tests {
 
         let mut interns = create_test_interns();
         let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
-            let vm = VM::new(Vec::new(), reader, interns, PrintWriter::Disabled);
+            let vm = VM::new(
+                Vec::new(),
+                reader,
+                interns,
+                PrintWriter::Disabled,
+                AssertMessageAnnotations::DEFAULT_MAX_BYTES.get(),
+            );
             value.as_index(&vm, Type::List)
         });
         assert_eq!(result.unwrap(), i64::MAX);
@@ -2902,7 +2957,13 @@ mod tests {
 
         let mut interns = create_test_interns();
         let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
-            let vm = VM::new(Vec::new(), reader, interns, PrintWriter::Disabled);
+            let vm = VM::new(
+                Vec::new(),
+                reader,
+                interns,
+                PrintWriter::Disabled,
+                AssertMessageAnnotations::DEFAULT_MAX_BYTES.get(),
+            );
             value.as_index(&vm, Type::List)
         });
         assert_eq!(result.unwrap(), i64::MIN);
@@ -2918,7 +2979,13 @@ mod tests {
 
         let mut interns = create_test_interns();
         let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
-            let vm = VM::new(Vec::new(), reader, interns, PrintWriter::Disabled);
+            let vm = VM::new(
+                Vec::new(),
+                reader,
+                interns,
+                PrintWriter::Disabled,
+                AssertMessageAnnotations::DEFAULT_MAX_BYTES.get(),
+            );
             value.as_index(&vm, Type::List)
         });
         assert!(result.is_err());
@@ -2934,7 +3001,13 @@ mod tests {
 
         let mut interns = create_test_interns();
         let result = HeapReader::with(&mut heap, &mut interns, |reader, interns| {
-            let vm = VM::new(Vec::new(), reader, interns, PrintWriter::Disabled);
+            let vm = VM::new(
+                Vec::new(),
+                reader,
+                interns,
+                PrintWriter::Disabled,
+                AssertMessageAnnotations::DEFAULT_MAX_BYTES.get(),
+            );
             value.as_index(&vm, Type::List)
         });
         assert!(result.is_err());
