@@ -1126,6 +1126,32 @@ impl ExcType {
         SimpleException::new_msg(Self::RuntimeError, "dictionary changed size during iteration").into()
     }
 
+    /// Creates a TypeError for `reversed()` on a non-reversible object.
+    ///
+    /// Matches CPython's format: `TypeError: '{type}' object is not reversible`
+    #[must_use]
+    pub(crate) fn type_error_not_reversible(type_: &str) -> RunError {
+        SimpleException::new_msg(Self::TypeError, format!("'{type_}' object is not reversible")).into()
+    }
+
+    /// Creates a RuntimeError for an over-deep iterator delegation chain.
+    ///
+    /// Monty-specific (CPython builds no delegation chain at all) — see
+    /// `limitations/builtins.md`.
+    #[must_use]
+    pub(crate) fn runtime_error_iter_delegation_too_deep() -> RunError {
+        SimpleException::new_msg(Self::RuntimeError, "iterator delegation nested too deeply").into()
+    }
+
+    /// Creates a RuntimeError for a delegating iterator pointing at a non-iterator.
+    ///
+    /// Unreachable from Python; only a malformed snapshot can produce it. Raised
+    /// rather than panicking so untrusted snapshot data cannot abort the process.
+    #[must_use]
+    pub(crate) fn runtime_error_iter_delegation_invalid() -> RunError {
+        SimpleException::new_msg(Self::RuntimeError, "iterator delegates to a non-iterator").into()
+    }
+
     /// Creates a RuntimeError for set mutation during iteration.
     ///
     /// Matches CPython's format: `RuntimeError: Set changed size during iteration`
