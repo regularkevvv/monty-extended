@@ -50,6 +50,13 @@ mechanism beyond dataclass field inheritance.
   "getattr(): attribute is not a simple value"` rather than returning a
   bound method object. Use direct attribute access (`obj.name(...)`) for
   these.
+- **`int(x, base=10)`** — string/bytes parsing accepts ASCII digits only;
+  CPython also accepts non-ASCII Unicode decimal digits (`int('١٢')` == 12),
+  which Monty rejects with `invalid literal for int() with base 10`.
+- **`bytes(source)`** — an iterable of ints is not supported: CPython's
+  `bytes([65, 66])` == `b'AB'`, Monty raises `TypeError: cannot convert
+  'list' object to bytes`. The int / str-with-encoding / bytes source forms
+  all work.
 - **`isinstance(obj, T)`** — `T` must be a built-in type (`int`, `str`,
   `list`, ...), a built-in exception class, a sandbox-defined class (see
   [classes.md](classes.md)), or a tuple of those. Passing a host-supplied
@@ -59,8 +66,11 @@ mechanism beyond dataclass field inheritance.
   `u32::MAX` raise `OverflowError` (see [resource_limits.md](resource_limits.md)).
 - **`sorted(iterable, *, key=None, reverse=False)`** — `key` and `reverse`
   must be passed by keyword; positional forms raise `TypeError`.
-- **`round(x, n)`** — `n` must be an integer; CPython accepts and truncates
-  floats.
+- **`round(n, ndigits)`** — `ndigits` values outside the i64 range are
+  clamped by sign. For floats this matches CPython (which clamps to
+  `Py_ssize_t`); for an int `n` with a hugely negative `ndigits`, CPython
+  tries to materialise `10**-ndigits` and dies with `MemoryError` where
+  Monty returns `0` immediately.
 - **`print`** — writes via the host print callback. `file=`, `flush=` are
   not honoured; `sep=` and `end=` are.
 - **`id(f)` / `hash(f)` / `f is g` / `f == g` for host-supplied callables**
